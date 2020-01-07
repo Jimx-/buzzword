@@ -7,7 +7,7 @@ rental! {
         use super::*;
 
         #[rental]
-        /// A shared pointer to an undo node protected by the epoch GC and the pin guard with
+        /// A shared pointer to a tree node protected by the epoch GC and the pin guard with
         /// which it is loaded.
         pub struct GuardedTreeNode<K, V>
         where
@@ -31,6 +31,7 @@ where
     InnerInsert(
         (K, NodeID), /* inserted item */
         (K, NodeID), /* next item */
+        usize,       /* insert location */
     ),
     InnerDelete(
         (K, NodeID), /* deleted item */
@@ -46,7 +47,11 @@ where
     ),
 
     Leaf(Vec<(K, V)>),
-    LeafInsert(K, V /* inserted item */),
+    LeafInsert(
+        (K, V), /* inserted item */
+        usize,  /* slot in base node */
+        bool,   /* overwrite the existing value? */
+    ),
     LeafDelete(K, V /* deleted item */),
     LeafSplit(K /* split key */, NodeID /* right sibling ID */),
     LeafRemove(NodeID /* removed node ID */),
@@ -66,8 +71,14 @@ where
     pub(super) high_key: K,
     pub(super) leftmost_child: NodeID,
     pub(super) right_link: NodeID,
+    /// Size of the base node. Used for adjusting the range of binary search during delta chain traversal.
     pub(super) base_size: usize,
+    /// Logical item count of the delta node.
+    pub(super) item_count: usize,
+    /// Length of the delta chain following this node.
+    pub(super) length: usize,
     pub(super) node: Node<K, V>,
+    /// Next node on the delta chain.
     pub(super) next: Atomic<TreeNode<K, V>>,
 }
 
@@ -75,6 +86,7 @@ impl<K, V> TreeNode<K, V>
 where
     K: Clone,
 {
+    #[inline(always)]
     pub fn is_leaf(&self) -> bool {
         match self.node {
             Node::Leaf(..) => true,
@@ -84,6 +96,15 @@ where
             Node::LeafRemove(..) => true,
             Node::LeafMerge(..) => true,
             _ => false,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_delta(&self) -> bool {
+        match self.node {
+            Node::Leaf(..) => false,
+            Node::Inner(..) => false,
+            _ => true,
         }
     }
 
@@ -100,6 +121,8 @@ where
             leftmost_child,
             right_link,
             base_size: items.len(),
+            item_count: items.len(),
+            length: 0,
             node: Node::Inner(items),
             next: Atomic::null(),
         }
@@ -112,21 +135,31 @@ where
             leftmost_child: INVALID_NODE_ID,
             right_link,
             base_size: items.len(),
+            item_count: items.len(),
+            length: 0,
             node: Node::Leaf(items),
             next: Atomic::null(),
         }
     }
 
-    pub fn new_leaf_insert(key: &K, value: V, next: &GuardedTreeNode<K, V>) -> Self {
-        next.rent(|base_ptr| {
-            let base = unsafe { base_ptr.deref() };
+    pub fn new_leaf_insert(
+        key: &K,
+        value: V,
+        slot: usize,
+        overwrite: bool,
+        next: &GuardedTreeNode<K, V>,
+    ) -> Self {
+        next.rent(|next_ptr| {
+            let next_node = unsafe { next_ptr.deref() };
             Self {
-                low_key: base.low_key.clone(),
-                high_key: base.high_key.clone(),
-                leftmost_child: base.leftmost_child,
-                right_link: base.right_link,
-                base_size: base.base_size,
-                node: Node::LeafInsert(key.clone(), value),
+                low_key: next_node.low_key.clone(),
+                high_key: next_node.high_key.clone(),
+                leftmost_child: next_node.leftmost_child,
+                right_link: next_node.right_link,
+                base_size: next_node.base_size,
+                item_count: next_node.item_count + 1,
+                length: next_node.length + 1,
+                node: Node::LeafInsert((key.clone(), value), slot, overwrite),
                 next: Atomic::null(),
             }
         })
