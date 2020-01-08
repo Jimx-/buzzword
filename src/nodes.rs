@@ -22,6 +22,9 @@ rental! {
 
 pub use self::rentals::GuardedTreeNode;
 
+unsafe impl<K: Clone, V> Sync for GuardedTreeNode<K, V> {}
+unsafe impl<K: Clone, V> Send for GuardedTreeNode<K, V> {}
+
 pub enum Node<K, V>
 where
     K: 'static + Clone,
@@ -128,6 +131,32 @@ where
         }
     }
 
+    pub fn new_inner_insert(
+        insert_item: (&K, NodeID),
+        next_item: (&K, NodeID),
+        slot: usize,
+        next: &TreeNode<K, V>,
+    ) -> Self {
+        let (insert_key, insert_id) = insert_item;
+        let (next_key, next_id) = next_item;
+
+        Self {
+            low_key: next.low_key.clone(),
+            high_key: next.high_key.clone(),
+            leftmost_child: next.leftmost_child,
+            right_link: next.right_link,
+            base_size: next.base_size,
+            item_count: next.item_count + 1,
+            length: next.length + 1,
+            node: Node::InnerInsert(
+                (insert_key.clone(), insert_id),
+                (next_key.clone(), next_id),
+                slot,
+            ),
+            next: Atomic::null(),
+        }
+    }
+
     pub fn new_leaf(low_key: K, high_key: K, right_link: NodeID, items: Vec<(K, V)>) -> Self {
         Self {
             low_key,
@@ -147,21 +176,37 @@ where
         value: V,
         slot: usize,
         overwrite: bool,
-        next: &GuardedTreeNode<K, V>,
+        next: &TreeNode<K, V>,
     ) -> Self {
-        next.rent(|next_ptr| {
-            let next_node = unsafe { next_ptr.deref() };
-            Self {
-                low_key: next_node.low_key.clone(),
-                high_key: next_node.high_key.clone(),
-                leftmost_child: next_node.leftmost_child,
-                right_link: next_node.right_link,
-                base_size: next_node.base_size,
-                item_count: next_node.item_count + 1,
-                length: next_node.length + 1,
-                node: Node::LeafInsert((key.clone(), value), slot, overwrite),
-                next: Atomic::null(),
-            }
-        })
+        Self {
+            low_key: next.low_key.clone(),
+            high_key: next.high_key.clone(),
+            leftmost_child: next.leftmost_child,
+            right_link: next.right_link,
+            base_size: next.base_size,
+            item_count: next.item_count + 1,
+            length: next.length + 1,
+            node: Node::LeafInsert((key.clone(), value), slot, overwrite),
+            next: Atomic::null(),
+        }
+    }
+
+    pub fn new_leaf_split(
+        split_key: &K,
+        sibling_id: NodeID,
+        next: &TreeNode<K, V>,
+        sibling: &TreeNode<K, V>,
+    ) -> Self {
+        Self {
+            low_key: next.low_key.clone(),
+            high_key: split_key.clone(),
+            leftmost_child: next.leftmost_child,
+            right_link: sibling_id,
+            base_size: next.base_size,
+            item_count: next.item_count - sibling.item_count,
+            length: next.length,
+            node: Node::LeafSplit(split_key.clone(), sibling_id),
+            next: Atomic::null(),
+        }
     }
 }
