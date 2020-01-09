@@ -54,7 +54,11 @@ where
         usize,  /* slot in base node */
         bool,   /* overwrite the existing value? */
     ),
-    LeafDelete(K, V /* deleted item */),
+    LeafDelete(
+        (K, V), /* deleted item */
+        usize,  /* slot in base node */
+        bool,   /* deleted value exists? */
+    ),
     LeafSplit(K /* split key */, NodeID /* right sibling ID */),
     LeafMerge(
         K,                     /* delete key */
@@ -203,6 +207,26 @@ where
             item_count: next.item_count + 1,
             length: next.length + 1,
             node: Node::LeafInsert((key.clone(), value), slot, overwrite),
+            next: Atomic::null(),
+        }
+    }
+
+    pub fn new_leaf_delete(
+        key: &K,
+        value: V,
+        slot: usize,
+        overwrite: bool,
+        next: &TreeNode<K, V>,
+    ) -> Self {
+        Self {
+            low_key: next.low_key.clone(),
+            high_key: next.high_key.clone(),
+            leftmost_child: next.leftmost_child,
+            right_link: next.right_link,
+            base_size: next.base_size,
+            item_count: next.item_count - 1,
+            length: next.length + 1,
+            node: Node::LeafDelete((key.clone(), value), slot, overwrite),
             next: Atomic::null(),
         }
     }

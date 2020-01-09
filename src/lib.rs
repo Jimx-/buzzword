@@ -22,6 +22,8 @@ use crossbeam::{
 };
 
 use std::{
+    collections::HashSet,
+    hash::Hash,
     ops::Deref,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -69,11 +71,10 @@ where
 pub struct BwTreeImpl<K, V>
 where
     K: 'static + Clone,
-    V: 'static + Clone,
+    V: 'static + Clone + Eq + Hash,
 {
     mapping_table: Vec<Atomic<TreeNode<K, V>>>,
     key_comparator: Box<dyn Sync + Send + Fn(&K, &K) -> std::cmp::Ordering>,
-    val_eq: Box<dyn Sync + Send + Fn(&V, &V) -> bool>,
     root_id: AtomicU64,
     next_node_id: AtomicU64,
     free_node_ids: SegQueue<NodeID>,
@@ -82,12 +83,11 @@ where
 impl<K, V> BwTreeImpl<K, V>
 where
     K: Clone + std::fmt::Debug,
-    V: Clone + std::fmt::Debug,
+    V: Clone + Eq + Hash + std::fmt::Debug,
 {
     pub fn new(
         mapping_table_size: usize,
         key_comparator: Box<dyn Sync + Send + Fn(&K, &K) -> std::cmp::Ordering>,
-        val_eq: Box<dyn Sync + Send + Fn(&V, &V) -> bool>,
     ) -> Self {
         let mut mapping_table = Vec::new();
         mapping_table.resize_with(mapping_table_size, || Atomic::null());
@@ -95,7 +95,6 @@ where
         let tree = Self {
             mapping_table,
             key_comparator,
-            val_eq,
             root_id: AtomicU64::new(1),
             next_node_id: AtomicU64::new(1),
             free_node_ids: SegQueue::new(),
@@ -302,31 +301,66 @@ where
         let mut vals = Vec::new();
         let mut delta_ptr = leaf;
 
+        let mut first = 0;
+        let mut last = unsafe { leaf.deref() }.base_size;
+
+        let mut add_set = HashSet::new();
+        let mut remove_set = HashSet::new();
+
         while !delta_ptr.is_null() {
             let delta = unsafe { delta_ptr.deref() };
 
             match &delta.node {
                 Node::Leaf(items) => {
                     if !items.is_empty() {
-                        let lower_bound =
-                            self.binary_search_key(items, key, 0, items.len() - 1, false);
+                        let lower_bound = self.binary_search_key(items, key, first, last, false);
 
                         for (k, v) in (&items[lower_bound..]).into_iter() {
                             if (self.key_comparator)(k, key) == std::cmp::Ordering::Equal {
-                                vals.push(v.clone());
+                                if !add_set.contains(v) && !remove_set.contains(v) {
+                                    vals.push(v.clone());
+                                }
                             } else {
                                 break;
                             }
                         }
                     }
                 }
-                Node::LeafInsert((k, v), _, _) => {
-                    if (self.key_comparator)(k, key) == std::cmp::Ordering::Equal {
-                        vals.push(v.clone());
+                Node::LeafInsert((k, v), slot, _) => match (self.key_comparator)(k, key) {
+                    std::cmp::Ordering::Equal => {
+                        // item key == search key
+                        if !add_set.contains(v) && !remove_set.contains(v) {
+                            add_set.insert(v);
+                            vals.push(v.clone());
+                        }
                     }
-                }
+                    std::cmp::Ordering::Greater => {
+                        // item key > search key
+                        last = *slot;
+                    }
+                    std::cmp::Ordering::Less => {
+                        // item key < search key
+                        first = *slot;
+                    }
+                },
+                Node::LeafDelete((k, v), slot, _) => match (self.key_comparator)(k, key) {
+                    std::cmp::Ordering::Equal => {
+                        // item key == search key
+                        if !add_set.contains(v) {
+                            remove_set.insert(v);
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        // item key > search key
+                        last = *slot;
+                    }
+                    std::cmp::Ordering::Less => {
+                        // item key < search key
+                        first = *slot;
+                    }
+                },
                 Node::LeafSplit(..) => {}
-                _ => {}
+                _ => unreachable!(),
             }
 
             delta_ptr = delta.next.load(Ordering::Relaxed, guard);
@@ -359,8 +393,7 @@ where
                     let lower_bound = self.binary_search_key(items, key, 0, items.len(), false);
 
                     for (i, (k, v)) in (&items[lower_bound..]).into_iter().enumerate() {
-                        if (self.key_comparator)(k, key) == std::cmp::Ordering::Equal
-                            && (self.val_eq)(v, value)
+                        if (self.key_comparator)(k, key) == std::cmp::Ordering::Equal && v == value
                         {
                             return Ok((node_id, node_ptr, true, i + lower_bound));
                         }
@@ -369,14 +402,17 @@ where
                     return Ok((node_id, node_ptr, false, lower_bound));
                 }
                 Node::LeafInsert((k, v), slot, overwrite) => {
-                    if (self.key_comparator)(k, key) == std::cmp::Ordering::Equal
-                        && (self.val_eq)(v, value)
-                    {
+                    if (self.key_comparator)(k, key) == std::cmp::Ordering::Equal && v == value {
                         return Ok((node_id, node_ptr, *overwrite, *slot));
                     }
                 }
+                Node::LeafDelete((k, v), slot, overwrite) => {
+                    if (self.key_comparator)(k, key) == std::cmp::Ordering::Equal && v == value {
+                        return Ok((node_id, node_ptr, !*overwrite, *slot));
+                    }
+                }
                 Node::LeafSplit(..) => {}
-                _ => {}
+                _ => unreachable!(),
             }
 
             delta_ptr = delta.next.load(Ordering::Relaxed, guard);
@@ -506,8 +542,8 @@ where
 
                     deltas.insert(pos, tuple);
                 }
-                Node::LeafSplit(..) => {}
-                _ => {}
+                Node::InnerSplit(..) => {}
+                _ => unreachable!(),
             }
 
             delta_ptr = delta.next.load(Ordering::Relaxed, guard);
@@ -612,8 +648,24 @@ where
 
                     deltas.insert(pos, tuple);
                 }
+                Node::LeafDelete((k, v), slot, overwrite) => {
+                    let tuple = (k.clone(), v.clone(), *slot, *overwrite, false);
+                    let pos = binary_search(
+                        &deltas,
+                        &tuple,
+                        0,
+                        deltas.len(),
+                        true,
+                        |(k1, _, s1, _, _), (k2, _, s2, _, _)| match (self.key_comparator)(k1, k2) {
+                            std::cmp::Ordering::Equal => s1.cmp(s2),
+                            otherwise => otherwise,
+                        },
+                    );
+
+                    deltas.insert(pos, tuple);
+                }
                 Node::LeafSplit(..) => {}
-                _ => {}
+                _ => unreachable!(),
             }
 
             delta_ptr = delta.next.load(Ordering::Relaxed, guard);
@@ -1100,31 +1152,66 @@ where
 
         self.traverse_leaf(leaf_node_ptr, key, guard)
     }
+
+    /// Delete a key-value pair from the tree.
+    pub fn delete(&self, key: &K, value: &V) -> bool {
+        let guard = &epoch::pin();
+        loop {
+            let (leaf_id, leaf_node_ptr, exists, slot) = loop {
+                let (leaf_id, leaf_node_ptr, path) = match self.search(key, guard) {
+                    Ok(result) => result,
+                    _ => continue,
+                };
+
+                match self.search_leaf(leaf_id, leaf_node_ptr, key, value, &path, guard) {
+                    Ok(result) => break result,
+                    _ => continue,
+                }
+            };
+
+            if !exists {
+                return false;
+            }
+
+            // install the insert delta
+            let delta = Owned::new(TreeNode::new_leaf_delete(
+                key,
+                value.clone(),
+                slot,
+                exists,
+                unsafe { leaf_node_ptr.deref() },
+            ));
+
+            delta.next.store(leaf_node_ptr, Ordering::Relaxed);
+
+            if self.cas_node(leaf_id, leaf_node_ptr, delta, guard).is_ok() {
+                break;
+            }
+        }
+
+        true
+    }
 }
 
 pub struct BwTree<K, V>(BwTreeImpl<K, V>)
 where
     K: 'static + Clone + Ord + std::fmt::Debug,
-    V: 'static + Clone + Eq + std::fmt::Debug;
+    V: 'static + Clone + Eq + Hash + std::fmt::Debug;
 
 impl<K, V> BwTree<K, V>
 where
     K: 'static + Clone + Ord + std::fmt::Debug,
-    V: 'static + Clone + Eq + std::fmt::Debug,
+    V: 'static + Clone + Eq + Hash + std::fmt::Debug,
 {
     pub fn new(mapping_table_size: usize) -> Self {
-        Self(BwTreeImpl::new(
-            mapping_table_size,
-            Box::new(K::cmp),
-            Box::new(V::eq),
-        ))
+        Self(BwTreeImpl::new(mapping_table_size, Box::new(K::cmp)))
     }
 }
 
 impl<K, V> Deref for BwTree<K, V>
 where
     K: 'static + Clone + Ord + std::fmt::Debug,
-    V: 'static + Clone + Eq + std::fmt::Debug,
+    V: 'static + Clone + Eq + Hash + std::fmt::Debug,
 {
     type Target = BwTreeImpl<K, V>;
 
@@ -1192,5 +1279,23 @@ mod tests {
             start.elapsed().as_millis(),
             (THREADS * SCALE) as f32 / (start.elapsed().as_millis()) as f32 / 1000.0
         );
+    }
+
+    #[test]
+    fn can_delete_values() {
+        let tree = Arc::new(BwTree::new(1024 * 1024 * 10));
+
+        for i in 0..10u32 {
+            tree.insert(&i, i + 1);
+        }
+
+        assert!(!tree.delete(&1, &1));
+
+        for i in 0..8u32 {
+            assert!(tree.delete(&i, &(i + 1)));
+        }
+
+        let vals = tree.get_values(&1);
+        assert_eq!(vals.len(), 0);
     }
 }
