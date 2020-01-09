@@ -33,7 +33,7 @@ where
     Inner(Vec<(K, NodeID)>),
     InnerInsert(
         (K, NodeID), /* inserted item */
-        (K, NodeID), /* next item */
+        Option<K>,   /* next key */
         usize,       /* insert location */
     ),
     InnerDelete(
@@ -68,8 +68,8 @@ where
     K: 'static + Clone,
     V: 'static,
 {
-    pub(super) low_key: K,
-    pub(super) high_key: K,
+    pub(super) low_key: Option<K>,
+    pub(super) high_key: Option<K>,
     pub(super) leftmost_child: NodeID,
     pub(super) right_link: NodeID,
     /// Size of the base node. Used for adjusting the range of binary search during delta chain traversal.
@@ -109,8 +109,8 @@ where
     }
 
     pub fn new_inner(
-        low_key: K,
-        high_key: K,
+        low_key: Option<K>,
+        high_key: Option<K>,
         leftmost_child: NodeID,
         right_link: NodeID,
         items: Vec<(K, NodeID)>,
@@ -130,12 +130,11 @@ where
 
     pub fn new_inner_insert(
         insert_item: (&K, NodeID),
-        next_item: (&K, NodeID),
+        next_key: &Option<K>,
         slot: usize,
         next: &TreeNode<K, V>,
     ) -> Self {
         let (insert_key, insert_id) = insert_item;
-        let (next_key, next_id) = next_item;
 
         Self {
             low_key: next.low_key.clone(),
@@ -145,11 +144,7 @@ where
             base_size: next.base_size,
             item_count: next.item_count + 1,
             length: next.length + 1,
-            node: Node::InnerInsert(
-                (insert_key.clone(), insert_id),
-                (next_key.clone(), next_id),
-                slot,
-            ),
+            node: Node::InnerInsert((insert_key.clone(), insert_id), next_key.clone(), slot),
             next: Atomic::null(),
         }
     }
@@ -162,7 +157,7 @@ where
     ) -> Self {
         Self {
             low_key: next.low_key.clone(),
-            high_key: split_key.clone(),
+            high_key: Some(split_key.clone()),
             leftmost_child: next.leftmost_child,
             right_link: sibling_id,
             base_size: next.base_size,
@@ -173,7 +168,12 @@ where
         }
     }
 
-    pub fn new_leaf(low_key: K, high_key: K, right_link: NodeID, items: Vec<(K, V)>) -> Self {
+    pub fn new_leaf(
+        low_key: Option<K>,
+        high_key: Option<K>,
+        right_link: NodeID,
+        items: Vec<(K, V)>,
+    ) -> Self {
         Self {
             low_key,
             high_key,
@@ -215,7 +215,7 @@ where
     ) -> Self {
         Self {
             low_key: next.low_key.clone(),
-            high_key: split_key.clone(),
+            high_key: Some(split_key.clone()),
             leftmost_child: next.leftmost_child,
             right_link: sibling_id,
             base_size: next.base_size,

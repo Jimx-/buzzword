@@ -21,7 +21,10 @@ use crossbeam::{
     queue::SegQueue,
 };
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    ops::Deref,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 type TreePath<'g, K, V> = Vec<(NodeID, Shared<'g, TreeNode<K, V>>)>;
 
@@ -63,29 +66,29 @@ where
     }
 }
 
-pub struct BwTree<K, V, KCmp, VEq>
+pub struct BwTreeImpl<K, V>
 where
-    K: 'static + Default + Clone,
+    K: 'static + Clone,
     V: 'static + Clone,
-    KCmp: Fn(&K, &K) -> std::cmp::Ordering,
-    VEq: Fn(&V, &V) -> bool,
 {
     mapping_table: Vec<Atomic<TreeNode<K, V>>>,
-    key_comparator: KCmp,
-    val_eq: VEq,
+    key_comparator: Box<dyn Sync + Send + Fn(&K, &K) -> std::cmp::Ordering>,
+    val_eq: Box<dyn Sync + Send + Fn(&V, &V) -> bool>,
     root_id: AtomicU64,
     next_node_id: AtomicU64,
     free_node_ids: SegQueue<NodeID>,
 }
 
-impl<K, V, KCmp, VEq> BwTree<K, V, KCmp, VEq>
+impl<K, V> BwTreeImpl<K, V>
 where
-    K: Default + Clone + std::fmt::Debug,
+    K: Clone + std::fmt::Debug,
     V: Clone + std::fmt::Debug,
-    KCmp: Fn(&K, &K) -> std::cmp::Ordering,
-    VEq: Fn(&V, &V) -> bool,
 {
-    pub fn new(mapping_table_size: usize, key_comparator: KCmp, val_eq: VEq) -> Self {
+    pub fn new(
+        mapping_table_size: usize,
+        key_comparator: Box<dyn Sync + Send + Fn(&K, &K) -> std::cmp::Ordering>,
+        val_eq: Box<dyn Sync + Send + Fn(&V, &V) -> bool>,
+    ) -> Self {
         let mut mapping_table = Vec::new();
         mapping_table.resize_with(mapping_table_size, || Atomic::null());
 
@@ -106,12 +109,7 @@ where
         let root_id = self.get_next_node_id();
         self.root_id.store(root_id, Ordering::Relaxed);
 
-        let root_node = TreeNode::<K, V>::new_leaf(
-            Default::default(),
-            Default::default(),
-            INVALID_NODE_ID,
-            Vec::new(),
-        );
+        let root_node = TreeNode::<K, V>::new_leaf(None, None, INVALID_NODE_ID, Vec::new());
 
         self.store_node(root_id, Some(root_node), Ordering::Relaxed);
     }
@@ -215,7 +213,7 @@ where
 
     /// Traverse the inner delta chain to locate the downlink for key.
     fn traverse_inner(&self, inner: Shared<TreeNode<K, V>>, key: &K, guard: &Guard) -> NodeID {
-        let mut first = 1;
+        let mut first = 0;
         let mut last = unsafe { inner.deref() }.base_size;
         let mut delta_ptr = inner;
 
@@ -224,17 +222,23 @@ where
 
             match &delta.node {
                 Node::Inner(items) => {
-                    let slot = self.binary_search_key(items, &key, first, last, true) - 1;
-                    let (_, child_id) = items[slot];
+                    let slot = self.binary_search_key(items, &key, first, last, true);
 
-                    break child_id;
+                    if slot == 0 {
+                        break delta.leftmost_child;
+                    } else {
+                        let (_, child_id) = items[slot - 1];
+                        break child_id;
+                    }
                 }
-                Node::InnerInsert((insert_key, insert_id), (next_key, next_id), slot) => {
+                Node::InnerInsert((insert_key, insert_id), next_key, slot) => {
                     // check if the inserted key is the search key and adjust the range for binary search accordingly
                     if (self.key_comparator)(key, insert_key) >= std::cmp::Ordering::Equal {
-                        if *next_id == INVALID_NODE_ID
-                            || (self.key_comparator)(key, next_key) == std::cmp::Ordering::Less
-                        {
+                        if let Some(ref next_key) = next_key {
+                            if (self.key_comparator)(key, next_key) == std::cmp::Ordering::Less {
+                                break *insert_id;
+                            }
+                        } else {
                             break *insert_id;
                         }
 
@@ -392,11 +396,13 @@ where
         loop {
             let node = unsafe { node_ptr.deref() };
 
-            if node.right_link != INVALID_NODE_ID
-                && (self.key_comparator)(key, &node.high_key) >= std::cmp::Ordering::Equal
-            {
-                node_id = node.right_link;
-                node_ptr = self.load_node(node.right_link, Ordering::Acquire, path, guard)?;
+            if let Some(ref high_key) = &node.high_key {
+                if (self.key_comparator)(key, high_key) >= std::cmp::Ordering::Equal {
+                    node_id = node.right_link;
+                    node_ptr = self.load_node(node.right_link, Ordering::Acquire, path, guard)?;
+                } else {
+                    break;
+                }
             } else {
                 break;
             }
@@ -421,10 +427,7 @@ where
         guard: &Guard,
     ) -> Vec<(K, NodeID)> {
         let mut delta_ptr = inner;
-        let (high_key, right_link) = unsafe {
-            let delta = delta_ptr.deref();
-            (&delta.high_key, delta.right_link)
-        };
+        let high_key = unsafe { &delta_ptr.deref().high_key };
 
         while !delta_ptr.is_null() {
             let delta = unsafe { delta_ptr.deref() };
@@ -434,10 +437,10 @@ where
                     let mut merged = Vec::new();
                     // merge items and deltas
 
-                    let copy_end = if right_link == INVALID_NODE_ID {
-                        items.len()
-                    } else {
+                    let copy_end = if let Some(ref high_key) = high_key {
                         self.binary_search_key(items, high_key, 0, items.len(), false)
+                    } else {
+                        items.len()
                     };
                     let (items, _) = items.split_at(copy_end);
                     let mut item_it = items.into_iter().enumerate();
@@ -525,10 +528,7 @@ where
         guard: &Guard,
     ) -> Vec<(K, V)> {
         let mut delta_ptr = leaf;
-        let (high_key, right_link) = unsafe {
-            let delta = delta_ptr.deref();
-            (&delta.high_key, delta.right_link)
-        };
+        let high_key = unsafe { &delta_ptr.deref().high_key };
 
         while !delta_ptr.is_null() {
             let delta = unsafe { delta_ptr.deref() };
@@ -538,10 +538,10 @@ where
                     let mut merged = Vec::new();
                     // merge items and deltas
 
-                    let copy_end = if right_link == INVALID_NODE_ID {
-                        items.len()
-                    } else {
+                    let copy_end = if let Some(ref high_key) = high_key {
                         self.binary_search_key(items, high_key, 0, items.len(), false)
+                    } else {
+                        items.len()
                     };
                     let (items, _) = items.split_at(copy_end);
                     let mut item_it = items.into_iter().enumerate();
@@ -879,7 +879,7 @@ where
                 Some((
                     split_key.clone(),
                     TreeNode::new_leaf(
-                        split_key.clone(),
+                        Some(split_key.clone()),
                         node.high_key.clone(),
                         node.right_link,
                         sibling_items,
@@ -893,7 +893,7 @@ where
                 Some((
                     split_key.clone(),
                     TreeNode::new_inner(
-                        split_key.clone(),
+                        Some(split_key.clone()),
                         node.high_key.clone(),
                         *leftmost_child,
                         node.right_link,
@@ -923,9 +923,9 @@ where
                 let insert_item = (split_key, *right_sibling_id);
                 let next_node_ptr = node.next.load(Ordering::Relaxed, guard);
                 let next_node = unsafe { next_node_ptr.deref() };
-                let next_item = (&next_node.high_key, next_node.right_link);
+                let next_key = &next_node.high_key;
 
-                match self.complete_split_smo(node_id, insert_item, next_item, path, guard) {
+                match self.complete_split_smo(node_id, insert_item, next_key, path, guard) {
                     Ok(true) => {
                         // consolidate the leaf node to remove the split delta and prevent other threads from attempting
                         // the SMO again
@@ -942,9 +942,9 @@ where
                 let insert_item = (split_key, *right_sibling_id);
                 let next_node_ptr = node.next.load(Ordering::Relaxed, guard);
                 let next_node = unsafe { next_node_ptr.deref() };
-                let next_item = (&next_node.high_key, next_node.right_link);
+                let next_key = &next_node.high_key;
 
-                match self.complete_split_smo(node_id, insert_item, next_item, path, guard) {
+                match self.complete_split_smo(node_id, insert_item, next_key, path, guard) {
                     Ok(true) => {
                         self.consolidate_inner_node(node_id, node_ptr, guard);
                         Err(())
@@ -961,7 +961,7 @@ where
         &self,
         node_id: NodeID,
         insert_item: (&K, NodeID),
-        next_item: (&K, NodeID),
+        next_item: &Option<K>,
         path: &TreePath<'g, K, V>,
         guard: &'g Guard,
     ) -> Result<bool, ()> {
@@ -973,14 +973,11 @@ where
 
             let new_root_id = self.get_next_node_id();
             let new_root = TreeNode::<K, V>::new_inner(
-                Default::default(),
-                Default::default(),
+                None,
+                None,
                 node_id,
                 INVALID_NODE_ID,
-                vec![
-                    (Default::default(), node_id),
-                    (insert_key.clone(), insert_id),
-                ],
+                vec![(insert_key.clone(), insert_id)],
             );
 
             self.store_node(new_root_id, Some(new_root), Ordering::Relaxed);
@@ -1029,7 +1026,7 @@ where
         parent_id: NodeID,
         parent_node_ptr: Shared<TreeNode<K, V>>,
         insert_item: (&K, NodeID),
-        next_item: (&K, NodeID),
+        next_key: &Option<K>,
         slot: usize,
         guard: &'g Guard,
     ) -> Result<bool, ()> {
@@ -1037,7 +1034,7 @@ where
 
         let delta = Owned::new(TreeNode::new_inner_insert(
             insert_item,
-            next_item,
+            next_key,
             slot,
             parent_node,
         ));
@@ -1105,6 +1102,37 @@ where
     }
 }
 
+pub struct BwTree<K, V>(BwTreeImpl<K, V>)
+where
+    K: 'static + Clone + Ord + std::fmt::Debug,
+    V: 'static + Clone + Eq + std::fmt::Debug;
+
+impl<K, V> BwTree<K, V>
+where
+    K: 'static + Clone + Ord + std::fmt::Debug,
+    V: 'static + Clone + Eq + std::fmt::Debug,
+{
+    pub fn new(mapping_table_size: usize) -> Self {
+        Self(BwTreeImpl::new(
+            mapping_table_size,
+            Box::new(K::cmp),
+            Box::new(V::eq),
+        ))
+    }
+}
+
+impl<K, V> Deref for BwTree<K, V>
+where
+    K: 'static + Clone + Ord + std::fmt::Debug,
+    V: 'static + Clone + Eq + std::fmt::Debug,
+{
+    type Target = BwTreeImpl<K, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1112,7 +1140,7 @@ mod tests {
 
     #[test]
     fn can_insert_values() {
-        let tree = Arc::new(BwTree::new(1024 * 1024 * 10, u32::cmp, u32::eq));
+        let tree = Arc::new(BwTree::new(1024 * 1024 * 10));
 
         const THREADS: u32 = 20;
         const SCALE: u32 = 5000000;
