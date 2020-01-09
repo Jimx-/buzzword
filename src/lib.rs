@@ -243,6 +243,7 @@ where
                         last = std::cmp::min(last, *slot);
                     }
                 }
+                Node::InnerSplit(..) => {}
                 _ => unreachable!(),
             }
 
@@ -284,6 +285,7 @@ where
                         return (*slot, Some(*insert_id));
                     }
                 }
+                Node::InnerSplit(..) => {}
                 _ => unreachable!(),
             }
 
@@ -401,6 +403,114 @@ where
         }
 
         Ok((node_id, node_ptr))
+    }
+
+    /// Collect all downliks on the inner delta chain.
+    fn collect_inner_downlinks(
+        &self,
+        inner: Shared<TreeNode<K, V>>,
+        guard: &Guard,
+    ) -> Vec<(K, NodeID)> {
+        self.collect_inner_downlinks_recur(inner, Vec::new(), guard)
+    }
+
+    fn collect_inner_downlinks_recur(
+        &self,
+        inner: Shared<TreeNode<K, V>>,
+        mut deltas: Vec<(K, NodeID, usize, bool)>,
+        guard: &Guard,
+    ) -> Vec<(K, NodeID)> {
+        let mut delta_ptr = inner;
+        let (high_key, right_link) = unsafe {
+            let delta = delta_ptr.deref();
+            (&delta.high_key, delta.right_link)
+        };
+
+        while !delta_ptr.is_null() {
+            let delta = unsafe { delta_ptr.deref() };
+
+            match &delta.node {
+                Node::Inner(ref items) => {
+                    let mut merged = Vec::new();
+                    // merge items and deltas
+
+                    let copy_end = if right_link == INVALID_NODE_ID {
+                        items.len()
+                    } else {
+                        self.binary_search_key(items, high_key, 0, items.len(), false)
+                    };
+                    let (items, _) = items.split_at(copy_end);
+                    let mut item_it = items.into_iter().enumerate();
+                    let mut delta_it = deltas.into_iter().peekable();
+
+                    while let Some((kd, vd, cur_slot, inserted)) = delta_it.next() {
+                        // copy from items until we reach cur_slot
+                        let cur_item = loop {
+                            if let Some((item_slot, (ki, vi))) = item_it.next() {
+                                if item_slot < cur_slot {
+                                    merged.push((ki.clone(), vi.clone()));
+                                } else {
+                                    break Some((ki, vi));
+                                }
+                            } else {
+                                break None;
+                            }
+                        };
+
+                        // handle all deltas that go in this slot
+                        if inserted {
+                            merged.push((kd, vd));
+                        }
+
+                        while let Some((_, _, slot, _)) = delta_it.peek() {
+                            if *slot != cur_slot {
+                                break;
+                            }
+
+                            if let Some((kd, vd, _, inserted)) = delta_it.next() {
+                                if inserted {
+                                    merged.push((kd, vd));
+                                }
+                            }
+                        }
+
+                        // add the current item
+                        if let Some((ki, vi)) = cur_item {
+                            merged.push((ki.clone(), vi.clone()));
+                        }
+                    }
+
+                    // drain the items
+                    while let Some((_, (ki, vi))) = item_it.next() {
+                        merged.push((ki.clone(), vi.clone()));
+                    }
+
+                    return merged;
+                }
+                Node::InnerInsert((k, id), _, slot) => {
+                    let tuple = (k.clone(), *id, *slot, true);
+                    let pos = binary_search(
+                        &deltas,
+                        &tuple,
+                        0,
+                        deltas.len(),
+                        true,
+                        |(k1, _, s1, _), (k2, _, s2, _)| match (self.key_comparator)(k1, k2) {
+                            std::cmp::Ordering::Equal => s1.cmp(s2),
+                            otherwise => otherwise,
+                        },
+                    );
+
+                    deltas.insert(pos, tuple);
+                }
+                Node::LeafSplit(..) => {}
+                _ => {}
+            }
+
+            delta_ptr = delta.next.load(Ordering::Relaxed, guard);
+        }
+
+        Vec::new()
     }
 
     /// Collect all values on the leaf delta chain.
@@ -565,10 +675,38 @@ where
                 return self.consolidate_leaf_node(node_id, node_ptr, guard);
             }
         } else {
-            if node.length >= MAX_INNER_CHAIN_LENGTH {}
+            if node.length >= MAX_INNER_CHAIN_LENGTH {
+                return self.consolidate_inner_node(node_id, node_ptr, guard);
+            }
         }
 
         None
+    }
+
+    fn consolidate_inner_node<'g>(
+        &self,
+        node_id: NodeID,
+        node_ptr: Shared<TreeNode<K, V>>,
+        guard: &'g Guard,
+    ) -> Option<Shared<'g, TreeNode<K, V>>> {
+        let downlinks = self.collect_inner_downlinks(node_ptr, guard);
+
+        let node = unsafe { node_ptr.deref() };
+        let new_inner = Owned::new(TreeNode::new_inner(
+            node.low_key.clone(),
+            node.high_key.clone(),
+            node.leftmost_child,
+            node.right_link,
+            downlinks,
+        ));
+
+        match self.cas_node(node_id, node_ptr, new_inner, guard) {
+            Ok(new) => {
+                self.destroy_delta_chain(node_ptr, guard);
+                Some(new)
+            }
+            _ => None,
+        }
     }
 
     /// Consolidate a leaf delta chain into a new base node.
@@ -658,14 +796,47 @@ where
                 Ok(None)
             }
         } else {
-            Ok(None)
+            if node.item_count >= MAX_INNER_ITEM_COUNT {
+                let (split_key, sibling) = match self.get_split_sibling(node_ptr) {
+                    None => return Ok(None),
+                    Some(sibling) => sibling,
+                };
+
+                let sibling_id = self.get_next_node_id();
+                let delta = Owned::new(TreeNode::new_inner_split(
+                    &split_key, sibling_id, node, &sibling,
+                ));
+
+                delta.next.store(node_ptr, Ordering::Relaxed);
+
+                // install the new sibling
+                self.store_node(sibling_id, Some(sibling), Ordering::Relaxed);
+
+                // install the delta
+                if let Err(_) = self.cas_node(node_id, node_ptr, delta, guard) {
+                    // clean up the sibling node
+                    let sibling_ptr = self.load_node_no_check(sibling_id, Ordering::Relaxed, guard);
+                    self.store_node(sibling_id, None, Ordering::Relaxed);
+                    self.free_node_ids.push(sibling_id);
+                    unsafe {
+                        guard.defer_destroy(sibling_ptr);
+                    }
+
+                    Ok(None)
+                } else {
+                    // abort and try again to complete the SMO
+                    Err(())
+                }
+            } else {
+                Ok(None)
+            }
         }
     }
 
     /// Find the location to split the node evenly into two nodes.
     fn get_split_location(&self, node: &TreeNode<K, V>) -> Option<usize> {
         match &node.node {
-            Node::Leaf(items) => {
+            Node::Leaf(ref items) => {
                 if items.len() < 2 {
                     return None;
                 }
@@ -679,8 +850,14 @@ where
                         return Some(i + 1 + mid);
                     }
                 }
-
                 None
+            }
+            Node::Inner(ref items) => {
+                if items.len() < 2 {
+                    return None;
+                }
+
+                Some(items.len() / 2)
             }
             _ => unreachable!(),
         }
@@ -704,6 +881,21 @@ where
                     TreeNode::new_leaf(
                         split_key.clone(),
                         node.high_key.clone(),
+                        node.right_link,
+                        sibling_items,
+                    ),
+                ))
+            }
+            Node::Inner(items) => {
+                let (split_key, leftmost_child) = &items[split_location];
+                let sibling_items = (&items[split_location..]).to_vec();
+
+                Some((
+                    split_key.clone(),
+                    TreeNode::new_inner(
+                        split_key.clone(),
+                        node.high_key.clone(),
+                        *leftmost_child,
                         node.right_link,
                         sibling_items,
                     ),
@@ -740,6 +932,21 @@ where
                         self.consolidate_leaf_node(node_id, node_ptr, guard);
                         // we cannot return the consolidated node here because the parent node is also updated
                         // so just abort the operation and let the thread traverse the tree again to observe the changes
+                        Err(())
+                    }
+                    Ok(false) => Ok(None),
+                    _ => Err(()),
+                }
+            }
+            Node::InnerSplit(split_key, right_sibling_id) => {
+                let insert_item = (split_key, *right_sibling_id);
+                let next_node_ptr = node.next.load(Ordering::Relaxed, guard);
+                let next_node = unsafe { next_node_ptr.deref() };
+                let next_item = (&next_node.high_key, next_node.right_link);
+
+                match self.complete_split_smo(node_id, insert_item, next_item, path, guard) {
+                    Ok(true) => {
+                        self.consolidate_inner_node(node_id, node_ptr, guard);
                         Err(())
                     }
                     Ok(false) => Ok(None),
@@ -901,18 +1108,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
     #[test]
     fn can_insert_values() {
-        let tree = Arc::new(BwTree::new(1024 * 1024, u32::cmp, u32::eq));
+        let tree = Arc::new(BwTree::new(1024 * 1024 * 10, u32::cmp, u32::eq));
+
+        const THREADS: u32 = 20;
+        const SCALE: u32 = 5000000;
 
         let mut handles = Vec::new();
-        for i in 0..100 {
+        let start = Instant::now();
+        for i in 0..THREADS {
             let tree = tree.clone();
             handles.push(std::thread::spawn(move || {
-                for j in 0..100 {
-                    let key = i * 100 + j;
+                for j in 0..SCALE {
+                    let key = i * SCALE + j;
                     tree.insert(&key, key + 1);
                 }
             }));
@@ -922,10 +1133,36 @@ mod tests {
             handle.join().unwrap();
         }
 
-        for i in 0..10000 {
-            let vals = tree.get_values(&i);
-            assert_eq!(vals.len(), 1);
-            assert_eq!(vals[0], i + 1);
+        println!(
+            "Inserted {} data points in {} millisec(s), throughput: {} Mop/s",
+            THREADS * SCALE,
+            start.elapsed().as_millis(),
+            (THREADS * SCALE) as f32 / (start.elapsed().as_millis()) as f32 / 1000.0
+        );
+
+        let mut handles = Vec::new();
+        let start = Instant::now();
+        for i in 0..THREADS {
+            let tree = tree.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..SCALE {
+                    let key = i * SCALE + j;
+                    let vals = tree.get_values(&key);
+                    assert_eq!(vals.len(), 1);
+                    assert_eq!(vals[0], key + 1);
+                }
+            }));
         }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        println!(
+            "Queried {} data points in {} millisec(s), throughput: {} Mop/s",
+            THREADS * SCALE,
+            start.elapsed().as_millis(),
+            (THREADS * SCALE) as f32 / (start.elapsed().as_millis()) as f32 / 1000.0
+        );
     }
 }

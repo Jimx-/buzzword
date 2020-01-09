@@ -41,8 +41,7 @@ where
         (K, NodeID), /* previous item */
         (K, NodeID), /* next item */
     ),
-    InnerSplit(K, NodeID /* deleted item */),
-    InnerRemove(NodeID /* removed node ID */),
+    InnerSplit(K /* split key */, NodeID /* right sibling ID */),
     InnerMerge(
         K,
         NodeID,                /* deleted item */
@@ -57,7 +56,6 @@ where
     ),
     LeafDelete(K, V /* deleted item */),
     LeafSplit(K /* split key */, NodeID /* right sibling ID */),
-    LeafRemove(NodeID /* removed node ID */),
     LeafMerge(
         K,                     /* delete key */
         NodeID,                /* deleted node ID */
@@ -96,7 +94,6 @@ where
             Node::LeafInsert(..) => true,
             Node::LeafDelete(..) => true,
             Node::LeafSplit(..) => true,
-            Node::LeafRemove(..) => true,
             Node::LeafMerge(..) => true,
             _ => false,
         }
@@ -153,6 +150,25 @@ where
                 (next_key.clone(), next_id),
                 slot,
             ),
+            next: Atomic::null(),
+        }
+    }
+
+    pub fn new_inner_split(
+        split_key: &K,
+        sibling_id: NodeID,
+        next: &TreeNode<K, V>,
+        sibling: &TreeNode<K, V>,
+    ) -> Self {
+        Self {
+            low_key: next.low_key.clone(),
+            high_key: split_key.clone(),
+            leftmost_child: next.leftmost_child,
+            right_link: sibling_id,
+            base_size: next.base_size,
+            item_count: next.item_count - sibling.item_count,
+            length: next.length,
+            node: Node::InnerSplit(split_key.clone(), sibling_id),
             next: Atomic::null(),
         }
     }
