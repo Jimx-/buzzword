@@ -21,9 +21,10 @@ where
         usize,               /* slot in base node */
     ),
     InnerSplit(K /* split key */, NodeID /* right sibling ID */),
+    InnerRemove(NodeID /* removed node ID */),
     InnerMerge(
-        K,
-        NodeID,                 /* deleted item */
+        K,                      /* deleted key */
+        NodeID,                 /* deleted node ID */
         Atomic<TreeNode<K, V>>, /* physical pointer to the merged node */
     ),
 
@@ -77,6 +78,7 @@ where
             Node::LeafInsert(..) => true,
             Node::LeafDelete(..) => true,
             Node::LeafSplit(..) => true,
+            Node::LeafRemove(..) => true,
             Node::LeafMerge(..) => true,
             _ => false,
         }
@@ -175,6 +177,43 @@ where
             item_count: next.item_count - sibling.item_count,
             length: next.length,
             node: Node::InnerSplit(split_key.clone(), sibling_id),
+            next: Atomic::null(),
+        }
+    }
+
+    pub fn new_inner_remove(node_id: NodeID, next: &TreeNode<K, V>) -> Self {
+        Self {
+            low_key: next.low_key.clone(),
+            high_key: next.high_key.clone(),
+            leftmost_child: next.leftmost_child,
+            right_link: next.right_link,
+            base_size: next.base_size,
+            item_count: next.item_count,
+            length: next.length,
+            node: Node::InnerRemove(node_id),
+            next: Atomic::null(),
+        }
+    }
+
+    pub fn new_inner_merge<'g>(
+        merge_key: &K,
+        removed_node_id: NodeID,
+        removed_node_ptr: Shared<TreeNode<K, V>>,
+        next: &TreeNode<K, V>,
+        removed_node: &TreeNode<K, V>,
+    ) -> Self {
+        let link = Atomic::null();
+        link.store(removed_node_ptr, Ordering::Relaxed);
+
+        Self {
+            low_key: next.low_key.clone(),
+            high_key: removed_node.high_key.clone(),
+            leftmost_child: next.leftmost_child,
+            right_link: removed_node.right_link,
+            base_size: next.base_size, // unused in leaf merge node
+            item_count: next.item_count + removed_node.item_count,
+            length: next.length + removed_node.length,
+            node: Node::InnerMerge(merge_key.clone(), removed_node_id, link),
             next: Atomic::null(),
         }
     }

@@ -8,6 +8,7 @@ pub(crate) const INVALID_NODE_ID: NodeID = 0;
 const MAX_INNER_CHAIN_LENGTH: usize = 8;
 const MAX_LEAF_CHAIN_LENGTH: usize = 8;
 
+const MIN_INNER_ITEM_COUNT: usize = 32;
 const MAX_INNER_ITEM_COUNT: usize = 128;
 const MIN_LEAF_ITEM_COUNT: usize = 32;
 const MAX_LEAF_ITEM_COUNT: usize = 128;
@@ -68,7 +69,7 @@ where
 
 pub struct BwTreeImpl<K, V>
 where
-    K: 'static + Clone,
+    K: 'static + Clone + std::fmt::Debug,
     V: Clone + Eq + Hash,
 {
     mapping_table: Vec<Atomic<TreeNode<K, V>>>,
@@ -191,14 +192,13 @@ where
         let mut node_ptr = self.load_node(node_id, Ordering::Acquire, &path, guard)?;
 
         loop {
-            let child_id = if unsafe { node_ptr.deref() }.is_leaf() {
+            if unsafe { node_ptr.deref() }.is_leaf() {
                 break;
-            } else {
-                self.traverse_inner(node_ptr, key, guard)
-            };
+            }
 
             path.push((node_id, node_ptr));
 
+            let child_id = self.traverse_inner(node_id, node_ptr, key, &path, guard)?;
             let child_node_ptr = self.load_node(child_id, Ordering::Acquire, &path, guard)?;
 
             node_id = child_id;
@@ -209,12 +209,21 @@ where
     }
 
     /// Traverse the inner delta chain to locate the downlink for key.
-    fn traverse_inner(&self, inner: Shared<TreeNode<K, V>>, key: &K, guard: &Guard) -> NodeID {
-        let mut first = 0;
-        let mut last = unsafe { inner.deref() }.base_size;
-        let mut delta_ptr = inner;
+    fn traverse_inner<'g>(
+        &self,
+        node_id: NodeID,
+        node_ptr: Shared<TreeNode<K, V>>,
+        key: &K,
+        path: &TreePath<'g, K, V>,
+        guard: &'g Guard,
+    ) -> Result<NodeID, ()> {
+        let (_, node_ptr) = self.move_right(key, node_id, node_ptr, path, guard)?;
 
-        loop {
+        let mut delta_ptr = node_ptr;
+        let mut first = 0;
+        let mut last = unsafe { delta_ptr.deref() }.base_size;
+
+        Ok(loop {
             let delta = unsafe { delta_ptr.deref() };
 
             match &delta.node {
@@ -266,11 +275,22 @@ where
                     }
                 }
                 Node::InnerSplit(..) => {}
+                Node::InnerMerge(merge_key, _, removed_node_atomic) => {
+                    if (self.key_comparator)(key, merge_key) >= std::cmp::Ordering::Equal {
+                        let removed_node_ptr = removed_node_atomic.load(Ordering::Relaxed, guard);
+
+                        delta_ptr = removed_node_ptr;
+                        first = 0;
+                        last = unsafe { delta_ptr.deref() }.base_size;
+
+                        continue;
+                    }
+                }
                 _ => unreachable!(),
             }
 
             delta_ptr = delta.next.load(Ordering::Relaxed, guard);
-        }
+        })
     }
 
     /// Search for the key in inner. If found, return the associated ID and the slot. Otherwise return the slot the key should be
@@ -321,12 +341,23 @@ where
     }
 
     /// Traverse the delta chain of a leaf node and collect all matching values.
-    fn traverse_leaf(&self, leaf: Shared<TreeNode<K, V>>, key: &K, guard: &Guard) -> Vec<V> {
+    fn traverse_leaf<'g>(
+        &self,
+        node_id: NodeID,
+        node_ptr: Shared<TreeNode<K, V>>,
+        key: &K,
+        path: &TreePath<'g, K, V>,
+        guard: &'g Guard,
+    ) -> Result<Vec<V>, ()> {
+        // need to move right when the leaf split delta is published but the downlink is not inserted into
+        // the parent node so we have to use the right link to navigate to the sibling node
+        let (_, node_ptr) = self.move_right(key, node_id, node_ptr, path, guard)?;
+
         let mut vals = Vec::new();
-        let mut delta_ptr = leaf;
+        let mut delta_ptr = node_ptr;
 
         let mut first = 0;
-        let mut last = unsafe { leaf.deref() }.base_size;
+        let mut last = unsafe { delta_ptr.deref() }.base_size;
 
         let mut add_set = HashSet::new();
         let mut remove_set = HashSet::new();
@@ -390,7 +421,7 @@ where
             delta_ptr = delta.next.load(Ordering::Relaxed, guard);
         }
 
-        vals
+        Ok(vals)
     }
 
     /// Search for the key-value pair in the leaf node. If the pair is found return its slot otherwise return the slot it will take.
@@ -616,6 +647,26 @@ where
                     }
                 }
                 Node::InnerSplit(..) => {}
+                Node::InnerMerge(merge_key, _, removed_node_atomic) => {
+                    let next_node = delta.next.load(Ordering::Relaxed, guard);
+                    let split_pos = binary_search(
+                        &deltas.iter().map(|x| &x.0).collect::<Vec<&K>>(),
+                        &merge_key,
+                        0,
+                        deltas.len(),
+                        false,
+                        |x, y| (self.key_comparator)(*x, *y),
+                    );
+                    let right_deltas = deltas.split_off(split_pos);
+                    let mut left_branch =
+                        self.collect_inner_downlinks_recur(next_node, deltas, guard);
+                    let removed_node_ptr = removed_node_atomic.load(Ordering::Relaxed, guard);
+                    let right_branch =
+                        self.collect_inner_downlinks_recur(removed_node_ptr, right_deltas, guard);
+
+                    left_branch.extend(right_branch);
+                    return left_branch;
+                }
                 _ => unreachable!(),
             }
 
@@ -739,8 +790,6 @@ where
                     deltas.insert(pos, tuple);
                 }
                 Node::LeafMerge(merge_key, _, removed_node_atomic) => {
-                    // the merge delta must be the first one on the chain because we disallow any insert/delete beyond the SMO
-                    // we only need to consolidate the two branch
                     let next_node = delta.next.load(Ordering::Relaxed, guard);
                     let split_pos = binary_search(
                         &deltas.iter().map(|x| &x.0).collect::<Vec<&K>>(),
@@ -929,8 +978,8 @@ where
                 if let Err(_) = self.cas_node(node_id, node_ptr, delta, guard) {
                     // clean up the sibling node
                     let sibling_ptr = self.load_node_no_check(sibling_id, Ordering::Relaxed, guard);
-                    self.store_node(sibling_id, None, Ordering::Relaxed);
-                    self.free_node_ids.push(sibling_id);
+                    // self.store_node(sibling_id, None, Ordering::Relaxed);
+                    // self.free_node_ids.push(sibling_id);
                     unsafe {
                         guard.defer_destroy(sibling_ptr);
                     }
@@ -984,8 +1033,8 @@ where
                 if let Err(_) = self.cas_node(node_id, node_ptr, delta, guard) {
                     // clean up the sibling node
                     let sibling_ptr = self.load_node_no_check(sibling_id, Ordering::Relaxed, guard);
-                    self.store_node(sibling_id, None, Ordering::Relaxed);
-                    self.free_node_ids.push(sibling_id);
+                    // self.store_node(sibling_id, None, Ordering::Relaxed);
+                    // self.free_node_ids.push(sibling_id);
                     unsafe {
                         guard.defer_destroy(sibling_ptr);
                     }
@@ -994,6 +1043,26 @@ where
                 } else {
                     // abort and try again to complete the SMO
                     Err(())
+                }
+            } else if node.item_count < MIN_INNER_ITEM_COUNT {
+                if path.is_empty() {
+                    // root underflow
+                    return Ok(None);
+                }
+
+                let (_, parent_node_ptr) = &path[path.len() - 1];
+                // do not merge leftmost leaf
+                if unsafe { parent_node_ptr.deref().leftmost_child } == node_id {
+                    return Ok(None);
+                }
+
+                // remove the node
+                let delta = Owned::new(TreeNode::new_inner_remove(node_id, node));
+                delta.next.store(node_ptr, Ordering::Relaxed);
+
+                match self.cas_node(node_id, node_ptr, delta, guard) {
+                    // need to abort anyway
+                    _ => Err(()),
                 }
             } else {
                 Ok(None)
@@ -1156,6 +1225,41 @@ where
                     _ => Err(()),
                 }
             }
+            Node::InnerRemove(removed_node_id) => {
+                let removed_node_ptr = node.next.load(Ordering::Relaxed, guard);
+                let removed_node = unsafe { removed_node_ptr.deref() };
+
+                // try to remove this node by publishing a node merge delta with the left sibling
+                let (left_sibling_id, left_sibling_ptr) =
+                    self.move_left(node_id, node_ptr, path, guard)?;
+
+                let left_sibling = unsafe { left_sibling_ptr.deref() };
+                let merge_key = match &left_sibling.high_key {
+                    Some(high_key) => high_key,
+                    _ => unreachable!(),
+                };
+
+                let delta = Owned::new(TreeNode::<K, V>::new_inner_merge(
+                    &merge_key,
+                    *removed_node_id,
+                    removed_node_ptr,
+                    left_sibling,
+                    removed_node,
+                ));
+
+                delta.next.store(left_sibling_ptr, Ordering::Relaxed);
+
+                match self.cas_node(left_sibling_id, left_sibling_ptr, delta, guard) {
+                    Ok(new_left_sibling) => {
+                        // CAS succeeds, this also prevents other threads from completing this remove SMO because the right link
+                        // of the left sibling will no longer match the removed node
+
+                        // continue to complete the merge SMO
+                        self.complete_smo(left_sibling_id, new_left_sibling, path, guard)
+                    }
+                    _ => Err(()),
+                }
+            }
             Node::LeafMerge(merge_key, removed_node_id, removed_node_atomic) => {
                 let delete_item = (merge_key, *removed_node_id);
                 let remove_node_ptr = removed_node_atomic.load(Ordering::Relaxed, guard);
@@ -1170,6 +1274,26 @@ where
                 ) {
                     Ok(true) => {
                         self.consolidate_leaf_node(node_id, node_ptr, guard);
+                        Err(())
+                    }
+                    Ok(false) => Ok(None),
+                    _ => Err(()),
+                }
+            }
+            Node::InnerMerge(merge_key, removed_node_id, removed_node_atomic) => {
+                let delete_item = (merge_key, *removed_node_id);
+                let remove_node_ptr = removed_node_atomic.load(Ordering::Relaxed, guard);
+
+                match self.complete_merge_smo(
+                    node_id,
+                    node_ptr,
+                    delete_item,
+                    remove_node_ptr, // removed node
+                    path,
+                    guard,
+                ) {
+                    Ok(true) => {
+                        self.consolidate_inner_node(node_id, node_ptr, guard);
                         Err(())
                     }
                     Ok(false) => Ok(None),
@@ -1328,6 +1452,17 @@ where
                         }
                     }
                 }
+                Node::InnerSplit(..) => {}
+                Node::InnerMerge(..) => {
+                    match self.consolidate_inner_node(node_id, delta_ptr, guard) {
+                        Some(node_ptr) => {
+                            delta_ptr = node_ptr;
+                            delta_items.clear();
+                            continue;
+                        }
+                        _ => return Err(()),
+                    }
+                }
                 _ => unreachable!(),
             }
 
@@ -1371,8 +1506,8 @@ where
             if !self.cas_root_node(node_id, new_root_id) {
                 // CAS failed, schedule to destroy the new root
                 let new_root_ptr = self.load_node_no_check(new_root_id, Ordering::Relaxed, guard);
-                self.store_node(new_root_id, None, Ordering::Relaxed);
-                self.free_node_ids.push(new_root_id);
+                // self.store_node(new_root_id, None, Ordering::Relaxed);
+                // self.free_node_ids.push(new_root_id);
                 unsafe {
                     guard.defer_destroy(new_root_ptr);
                 }
@@ -1476,8 +1611,8 @@ where
                         let removed_node_ptr =
                             self.load_node_no_check(*delete_id, Ordering::Relaxed, guard);
                         self.destroy_delta_chain(removed_node_ptr, guard);
-                        self.store_node(*delete_id, None, Ordering::Release);
-                        self.free_node_ids.push(*delete_id);
+                        // self.store_node(*delete_id, None, Ordering::Release);
+                        // self.free_node_ids.push(*delete_id);
                         Ok(true)
                     }
                     _ => Err(()),
@@ -1532,14 +1667,17 @@ where
     /// Get the list of values associated with the key.
     pub fn get_values(&self, key: &K) -> Vec<V> {
         let guard = &epoch::pin();
-        let (_, leaf_node_ptr, _) = loop {
-            match self.search(key, guard) {
-                Ok(result) => break result,
+        loop {
+            let (leaf_node_id, leaf_node_ptr, path) = match self.search(key, guard) {
+                Ok(result) => result,
+                _ => continue,
+            };
+
+            match self.traverse_leaf(leaf_node_id, leaf_node_ptr, key, &path, guard) {
+                Ok(result) => return result,
                 _ => continue,
             }
-        };
-
-        self.traverse_leaf(leaf_node_ptr, key, guard)
+        }
     }
 
     /// Delete a key-value pair from the tree.
@@ -1615,11 +1753,10 @@ mod tests {
     use std::{sync::Arc, time::Instant};
 
     #[test]
-    fn can_insert_and_values() {
+    fn can_insert_and_delete_values() {
         let tree = Arc::new(BwTree::new(1024 * 1024 * 10));
 
         const THREADS: u32 = 20;
-        // const SCALE: u32 = 5000000;
         const SCALE: u32 = 5000000;
 
         let mut handles = Vec::new();
