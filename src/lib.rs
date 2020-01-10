@@ -12,9 +12,10 @@ const MAX_INNER_CHAIN_LENGTH: usize = 8;
 const MAX_LEAF_CHAIN_LENGTH: usize = 8;
 
 const MAX_INNER_ITEM_COUNT: usize = 128;
+const MIN_LEAF_ITEM_COUNT: usize = 32;
 const MAX_LEAF_ITEM_COUNT: usize = 128;
 
-use crate::nodes::{Node, TreeNode};
+use crate::nodes::{GuardedTreeNode, Node, TreeNode};
 
 use crossbeam::{
     epoch::{self, Atomic, Guard, Owned, Pointer, Shared},
@@ -133,7 +134,7 @@ where
         &self,
         id: NodeID,
         order: Ordering,
-        path: &TreePath<K, V>,
+        path: &TreePath<'g, K, V>,
         guard: &'g Guard,
     ) -> Result<Shared<'g, TreeNode<K, V>>, ()> {
         let mut node = self.mapping_table[id as usize].load(order, guard);
@@ -149,7 +150,7 @@ where
             node = new_node;
         }
 
-        if let Some(new_node) = self.try_smo(id, node, guard)? {
+        if let Some(new_node) = self.try_smo(id, node, path, guard)? {
             node = new_node;
         }
 
@@ -246,6 +247,27 @@ where
                         last = std::cmp::min(last, *slot);
                     }
                 }
+                Node::InnerDelete((delete_key, _), (prev_key, prev_id), (next_key, _), slot) => {
+                    if delta.leftmost_child == *prev_id
+                        || (prev_key.is_some()
+                            && (self.key_comparator)(key, prev_key.as_ref().unwrap())
+                                >= std::cmp::Ordering::Equal)
+                    {
+                        if let Some(next_key) = next_key {
+                            if (self.key_comparator)(key, next_key) == std::cmp::Ordering::Less {
+                                break *prev_id; // prev is the merged node
+                            }
+                        } else {
+                            break *prev_id;
+                        }
+                    }
+
+                    if (self.key_comparator)(key, delete_key) >= std::cmp::Ordering::Equal {
+                        first = std::cmp::max(first, *slot);
+                    } else {
+                        last = std::cmp::min(last, *slot);
+                    }
+                }
                 Node::InnerSplit(..) => {}
                 _ => unreachable!(),
             }
@@ -286,6 +308,11 @@ where
                 Node::InnerInsert((insert_key, insert_id), _, slot) => {
                     if (self.key_comparator)(insert_key, key) == std::cmp::Ordering::Equal {
                         return (*slot, Some(*insert_id));
+                    }
+                }
+                Node::InnerDelete((delete_key, _), _, _, slot) => {
+                    if (self.key_comparator)(delete_key, key) == std::cmp::Ordering::Equal {
+                        return (*slot, None);
                     }
                 }
                 Node::InnerSplit(..) => {}
@@ -411,6 +438,28 @@ where
                         return Ok((node_id, node_ptr, !*overwrite, *slot));
                     }
                 }
+                Node::LeafMerge(merge_key, removed_node_id, removed_node_ptr) => {
+                    if (self.key_comparator)(key, merge_key) >= std::cmp::Ordering::Equal {
+                        // go to right branch
+                        match removed_node_ptr.rent_all(|borrows| {
+                            match self.search_leaf(
+                                *removed_node_id,
+                                *borrows.node,
+                                key,
+                                value,
+                                path,
+                                borrows.guard,
+                            ) {
+                                // discard the pointer as it cannot be carried outside the closure
+                                Ok((_, _, exists, slot)) => Ok((exists, slot)),
+                                _ => Err(()),
+                            }
+                        }) {
+                            Ok((exists, slot)) => return Ok((node_id, node_ptr, exists, slot)),
+                            _ => return Err(()),
+                        }
+                    }
+                }
                 Node::LeafSplit(..) => {}
                 _ => unreachable!(),
             }
@@ -426,7 +475,7 @@ where
         key: &K,
         mut node_id: NodeID,
         mut node_ptr: Shared<'g, TreeNode<K, V>>,
-        path: &TreePath<K, V>,
+        path: &TreePath<'g, K, V>,
         guard: &'g Guard,
     ) -> Result<(NodeID, Shared<'g, TreeNode<K, V>>), ()> {
         loop {
@@ -471,57 +520,65 @@ where
             match &delta.node {
                 Node::Inner(ref items) => {
                     let mut merged = Vec::new();
-                    // merge items and deltas
 
+                    // merge items and deltas
                     let copy_end = if let Some(ref high_key) = high_key {
                         self.binary_search_key(items, high_key, 0, items.len(), false)
                     } else {
                         items.len()
                     };
                     let (items, _) = items.split_at(copy_end);
-                    let mut item_it = items.into_iter().enumerate();
-                    let mut delta_it = deltas.into_iter().peekable();
+                    let mut item_it = items.into_iter().cloned();
+                    let mut delta_it = deltas.into_iter();
 
-                    while let Some((kd, vd, cur_slot, inserted)) = delta_it.next() {
-                        // copy from items until we reach cur_slot
-                        let cur_item = loop {
-                            if let Some((item_slot, (ki, vi))) = item_it.next() {
-                                if item_slot < cur_slot {
-                                    merged.push((ki.clone(), vi.clone()));
-                                } else {
-                                    break Some((ki, vi));
+                    let mut cur_item = item_it.next();
+                    let mut cur_delta = delta_it.next();
+                    loop {
+                        match (cur_item, cur_delta) {
+                            (None, None) => break,
+                            (None, Some((k, v, _, insert))) => {
+                                // drain deltas
+                                if insert {
+                                    merged.push((k, v));
                                 }
-                            } else {
-                                break None;
-                            }
-                        };
-
-                        // handle all deltas that go in this slot
-                        if inserted {
-                            merged.push((kd, vd));
-                        }
-
-                        while let Some((_, _, slot, _)) = delta_it.peek() {
-                            if *slot != cur_slot {
+                                merged.extend(
+                                    delta_it
+                                        .filter(|(_, _, _, insert)| *insert)
+                                        .map(|(k, v, _, _)| (k, v)),
+                                );
                                 break;
                             }
+                            (Some(item), None) => {
+                                // drain items
+                                merged.push(item);
+                                merged.extend(item_it);
+                                break;
+                            }
+                            (Some((ki, vi)), Some((kd, vd, slot, insert))) => {
+                                match (self.key_comparator)(&ki, &kd) {
+                                    std::cmp::Ordering::Greater => {
+                                        if insert {
+                                            merged.push((kd, vd));
+                                        }
+                                        cur_delta = delta_it.next();
+                                        cur_item = Some((ki, vi));
+                                    }
+                                    std::cmp::Ordering::Less => {
+                                        merged.push((ki, vi));
+                                        cur_item = item_it.next();
+                                        cur_delta = Some((kd, vd, slot, insert));
+                                    }
+                                    _ => {
+                                        if insert {
+                                            merged.push((kd, vd));
+                                        }
 
-                            if let Some((kd, vd, _, inserted)) = delta_it.next() {
-                                if inserted {
-                                    merged.push((kd, vd));
+                                        cur_delta = delta_it.next();
+                                        cur_item = item_it.next();
+                                    }
                                 }
                             }
                         }
-
-                        // add the current item
-                        if let Some((ki, vi)) = cur_item {
-                            merged.push((ki.clone(), vi.clone()));
-                        }
-                    }
-
-                    // drain the items
-                    while let Some((_, (ki, vi))) = item_it.next() {
-                        merged.push((ki.clone(), vi.clone()));
                     }
 
                     return merged;
@@ -533,14 +590,38 @@ where
                         &tuple,
                         0,
                         deltas.len(),
-                        true,
+                        false,
                         |(k1, _, s1, _), (k2, _, s2, _)| match (self.key_comparator)(k1, k2) {
                             std::cmp::Ordering::Equal => s1.cmp(s2),
                             otherwise => otherwise,
                         },
                     );
 
-                    deltas.insert(pos, tuple);
+                    if pos >= deltas.len()
+                        || (self.key_comparator)(&deltas[pos].0, k) != std::cmp::Ordering::Equal
+                    {
+                        deltas.insert(pos, tuple);
+                    }
+                }
+                Node::InnerDelete((k, id), _, _, slot) => {
+                    let tuple = (k.clone(), *id, *slot, false);
+                    let pos = binary_search(
+                        &deltas,
+                        &tuple,
+                        0,
+                        deltas.len(),
+                        false,
+                        |(k1, _, s1, _), (k2, _, s2, _)| match (self.key_comparator)(k1, k2) {
+                            std::cmp::Ordering::Equal => s1.cmp(s2),
+                            otherwise => otherwise,
+                        },
+                    );
+
+                    if pos >= deltas.len()
+                        || (self.key_comparator)(&deltas[pos].0, k) != std::cmp::Ordering::Equal
+                    {
+                        deltas.insert(pos, tuple);
+                    }
                 }
                 Node::InnerSplit(..) => {}
                 _ => unreachable!(),
@@ -579,6 +660,7 @@ where
                     } else {
                         items.len()
                     };
+
                     let (items, _) = items.split_at(copy_end);
                     let mut item_it = items.into_iter().enumerate();
                     let mut delta_it = deltas.into_iter().peekable();
@@ -663,6 +745,27 @@ where
                     );
 
                     deltas.insert(pos, tuple);
+                }
+                Node::LeafMerge(merge_key, _, guarded_ptr) => {
+                    // the merge delta must be the first one on the chain because we disallow any insert/delete beyond the SMO
+                    // we only need to consolidate the two branch
+                    let next_node = delta.next.load(Ordering::Relaxed, guard);
+                    let split_pos = binary_search(
+                        &deltas.iter().map(|x| &x.0).collect::<Vec<&K>>(),
+                        &merge_key,
+                        0,
+                        deltas.len(),
+                        false,
+                        |x, y| (self.key_comparator)(*x, *y),
+                    );
+                    let right_deltas = deltas.split_off(split_pos);
+                    let mut left_branch = self.collect_leaf_values_recur(next_node, deltas, guard);
+                    let right_branch = guarded_ptr.rent_all(move |borrows| {
+                        self.collect_leaf_values_recur(*borrows.node, right_deltas, borrows.guard)
+                    });
+
+                    left_branch.extend(right_branch);
+                    return left_branch;
                 }
                 Node::LeafSplit(..) => {}
                 _ => unreachable!(),
@@ -803,6 +906,7 @@ where
         &self,
         node_id: NodeID,
         node_ptr: Shared<TreeNode<K, V>>,
+        path: &TreePath<'g, K, V>,
         guard: &'g Guard,
     ) -> Result<Option<Shared<'g, TreeNode<K, V>>>, ()> {
         let node = unsafe { node_ptr.deref() };
@@ -843,6 +947,26 @@ where
                 } else {
                     // abort and try again to complete the SMO
                     Err(())
+                }
+            } else if node.item_count < MIN_LEAF_ITEM_COUNT {
+                if path.is_empty() {
+                    // root underflow
+                    return Ok(None);
+                }
+
+                let (_, parent_node_ptr) = &path[path.len() - 1];
+                // do not merge leftmost leaf
+                if unsafe { parent_node_ptr.deref().leftmost_child } == node_id {
+                    return Ok(None);
+                }
+
+                // remove the node
+                let delta = Owned::new(TreeNode::new_leaf_remove(node_id, node));
+                delta.next.store(node_ptr, Ordering::Relaxed);
+
+                match self.cas_node(node_id, node_ptr, delta, guard) {
+                    // need to abort anyway
+                    _ => Err(()),
                 }
             } else {
                 Ok(None)
@@ -1005,7 +1129,228 @@ where
                     _ => Err(()),
                 }
             }
+            Node::LeafRemove(_) => {
+                // try to remove this node by publishing a node merge delta with the left sibling
+                let (left_sibling_id, left_sibling_ptr) =
+                    self.move_left(node_id, node_ptr, path, guard)?;
+
+                let left_sibling = unsafe { left_sibling_ptr.deref() };
+                let merge_key = match &left_sibling.high_key {
+                    Some(high_key) => high_key,
+                    _ => unreachable!(),
+                };
+
+                let guard_removed = Box::new(epoch::pin());
+                let guarded_ptr = GuardedTreeNode::new(guard_removed, |guard| {
+                    node.next.load(Ordering::Relaxed, guard)
+                });
+
+                let delta = Owned::new(TreeNode::<K, V>::new_leaf_merge(
+                    &merge_key,
+                    node_id,
+                    guarded_ptr,
+                    left_sibling,
+                    node,
+                ));
+
+                delta.next.store(left_sibling_ptr, Ordering::Relaxed);
+
+                match self.cas_node(left_sibling_id, left_sibling_ptr, delta, guard) {
+                    Ok(new_left_sibling) => {
+                        // CAS succeeds, this also prevents other threads from completing this remove SMO because the right link
+                        // of the left sibling will no longer match the removed node
+
+                        // continue to complete the merge SMO
+                        self.complete_smo(left_sibling_id, new_left_sibling, path, guard)
+                    }
+                    _ => Err(()),
+                }
+            }
+            Node::LeafMerge(merge_key, removed_node_id, guarded_ptr) => {
+                let delete_item = (merge_key, *removed_node_id);
+
+                guarded_ptr.rent(move |node| {
+                    match self.complete_merge_smo(
+                        node_id,
+                        node_ptr,
+                        delete_item,
+                        *node, // removed node
+                        path,
+                        guard,
+                    ) {
+                        Ok(true) => {
+                            self.consolidate_leaf_node(node_id, node_ptr, guard);
+                            Err(())
+                        }
+                        Ok(false) => Ok(None),
+                        _ => Err(()),
+                    }
+                })
+            }
             _ => Ok(None),
+        }
+    }
+
+    fn move_left<'g>(
+        &self,
+        node_id: NodeID,
+        node_ptr: Shared<TreeNode<K, V>>,
+        path: &TreePath<'g, K, V>,
+        guard: &'g Guard,
+    ) -> Result<(NodeID, Shared<'g, TreeNode<K, V>>), ()> {
+        let (parent_node_id, parent_node_ptr) = &path[path.len() - 1];
+        let leftmost_child = unsafe { parent_node_ptr.deref().leftmost_child };
+        // do not merge leftmost leaf
+        if leftmost_child == node_id {
+            return Err(());
+        }
+
+        if parent_node_ptr != &self.load_node_no_check(*parent_node_id, Ordering::Acquire, guard) {
+            // parent has changed
+            return Err(());
+        }
+
+        let node = unsafe { node_ptr.deref() };
+        let low_key = match &node.low_key {
+            Some(low_key) => low_key,
+            None => unreachable!(), // the node is not the leftmost leaf so low key must be valid
+        };
+
+        // refind the left sibling in parent node
+        let mut delta_ptr = *parent_node_ptr;
+        // collect all items on the delta chain whose keys are <= low_key
+        let mut delta_items = Vec::new();
+        let left_sibling_id = loop {
+            let delta = unsafe { delta_ptr.deref() };
+
+            match &delta.node {
+                Node::Inner(ref items) => {
+                    // use upper bound to avoid underflow in case the left sibling is the leftmost child
+                    // +1 to avoid underflow
+                    let low_slot = self.binary_search_key(items, low_key, 0, items.len(), true);
+
+                    // the last item of (items[..low_key] U delta_items) is the removed node that we are looking for
+                    // we need to take one step back and take the second item
+                    let mut remaining = 2; // one step back + the second item
+                    let mut item_it = items.iter().take(low_slot).rev().cloned();
+                    let mut delta_it = delta_items.into_iter().rev();
+                    let mut left_sibling_id = 0;
+
+                    let mut item = item_it.next();
+                    let mut delta_item = delta_it.next();
+
+                    while remaining > 0 {
+                        match (item, delta_item) {
+                            (None, None) => {
+                                // both streams are drain -- use the leftmost child
+                                left_sibling_id = leftmost_child;
+                                remaining -= 1;
+                                item = None;
+                                delta_item = None;
+                            }
+                            (Some((_, v)), None) => {
+                                // take from base node
+                                left_sibling_id = v;
+                                delta_item = None;
+                                item = item_it.next();
+                                remaining -= 1;
+                            }
+                            (None, Some((_, v, insert))) => {
+                                if insert {
+                                    left_sibling_id = v;
+                                    remaining -= 1;
+                                }
+                                delta_item = delta_it.next();
+                                item = None;
+                            }
+                            (Some((cur_key, cur_id)), Some((delta_key, delta_id, insert))) => {
+                                // compare the last items on delta chain and in the base node
+                                match (self.key_comparator)(&delta_key, &cur_key) {
+                                    std::cmp::Ordering::Equal => {
+                                        // deleted or overwritten item in the base node
+                                        if insert {
+                                            left_sibling_id = delta_id;
+                                            remaining -= 1;
+                                        }
+
+                                        item = item_it.next();
+                                        delta_item = delta_it.next();
+                                    }
+                                    std::cmp::Ordering::Less => {
+                                        // take from the base node
+                                        left_sibling_id = cur_id;
+                                        item = item_it.next();
+                                        delta_item = Some((delta_key, delta_id, insert));
+                                        remaining -= 1;
+                                    }
+                                    std::cmp::Ordering::Greater => {
+                                        // take from delta chain
+                                        if insert {
+                                            left_sibling_id = delta_id;
+                                            remaining -= 1;
+                                        }
+                                        item = Some((cur_key.clone(), cur_id));
+                                        delta_item = delta_it.next();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    break left_sibling_id;
+                }
+                Node::InnerInsert((key, node_id), _, _) => {
+                    if (self.key_comparator)(key, low_key) <= std::cmp::Ordering::Equal {
+                        let tuple = (key.clone(), *node_id, true);
+                        let pos = binary_search(
+                            &delta_items,
+                            &tuple,
+                            0,
+                            delta_items.len(),
+                            false,
+                            |(k1, _, _), (k2, _, _)| (self.key_comparator)(k1, k2),
+                        );
+
+                        if pos >= delta_items.len()
+                            || (self.key_comparator)(&delta_items[pos].0, key)
+                                != std::cmp::Ordering::Equal
+                        {
+                            delta_items.insert(pos, tuple);
+                        }
+                    }
+                }
+                Node::InnerDelete((key, node_id), _, _, _) => {
+                    if (self.key_comparator)(key, low_key) <= std::cmp::Ordering::Equal {
+                        let tuple = (key.clone(), *node_id, false);
+                        let pos = binary_search(
+                            &delta_items,
+                            &tuple,
+                            0,
+                            delta_items.len(),
+                            false,
+                            |(k1, _, _), (k2, _, _)| (self.key_comparator)(k1, k2),
+                        );
+
+                        if pos >= delta_items.len()
+                            || (self.key_comparator)(&delta_items[pos].0, key)
+                                != std::cmp::Ordering::Equal
+                        {
+                            delta_items.insert(pos, tuple);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+
+            delta_ptr = delta.next.load(Ordering::Relaxed, guard);
+        };
+
+        let left_sibling = self.load_node(left_sibling_id, Ordering::Acquire, path, guard)?;
+
+        if unsafe { left_sibling.deref().right_link } != node_id {
+            Err(())
+        } else {
+            Ok((left_sibling_id, left_sibling))
         }
     }
 
@@ -1096,6 +1441,61 @@ where
         self.cas_node(parent_id, parent_node_ptr, delta, guard)
             .map(|_| true)
             .map_err(|_| ())
+    }
+
+    fn complete_merge_smo<'g>(
+        &self,
+        node_id: NodeID,
+        node_ptr: Shared<TreeNode<K, V>>,
+        delete_item: (&K, NodeID),
+        right_sibling_ptr: Shared<TreeNode<K, V>>,
+        path: &TreePath<'g, K, V>,
+        guard: &'g Guard,
+    ) -> Result<bool, ()> {
+        let (parent_id, parent_node_ptr) = &path[path.len() - 1];
+        let (merge_key, delete_id) = &delete_item;
+
+        if *parent_node_ptr != self.load_node_no_check(*parent_id, Ordering::Acquire, guard) {
+            return Err(());
+        }
+
+        let node = unsafe { node_ptr.deref() };
+        let parent_node = unsafe { parent_node_ptr.deref() };
+        let right_sibling = unsafe { right_sibling_ptr.deref() };
+
+        match self.search_inner(*parent_node_ptr, merge_key, guard) {
+            (slot, Some(_)) => {
+                // delete the removed node from parent
+                let delta = Owned::new(TreeNode::<K, V>::new_inner_delete(
+                    merge_key,
+                    *delete_id,
+                    &node.low_key,
+                    node_id,
+                    &right_sibling.high_key,
+                    right_sibling.right_link,
+                    slot,
+                    parent_node,
+                ));
+
+                delta.next.store(*parent_node_ptr, Ordering::Relaxed);
+
+                match self.cas_node(*parent_id, *parent_node_ptr, delta, guard) {
+                    Ok(_) => {
+                        // CAS succeeds, all accesses to the removed node will be redirected to the left sibling
+                        // from now on the removed node is only accessed through the guarded pointer in the node merge delta
+                        // so we can schedule to destroy the removed node and reclaim its node ID now
+                        let removed_node_ptr =
+                            self.load_node_no_check(*delete_id, Ordering::Relaxed, guard);
+                        self.destroy_delta_chain(removed_node_ptr, guard);
+                        self.store_node(*delete_id, None, Ordering::Release);
+                        self.free_node_ids.push(*delete_id);
+                        Ok(true)
+                    }
+                    _ => Err(()),
+                }
+            }
+            (_, None) => Ok(false),
+        }
     }
 
     /// Insert a key-value pair into the tree.
@@ -1226,11 +1626,12 @@ mod tests {
     use std::{sync::Arc, time::Instant};
 
     #[test]
-    fn can_insert_values() {
+    fn can_insert_and_values() {
         let tree = Arc::new(BwTree::new(1024 * 1024 * 10));
 
         const THREADS: u32 = 20;
-        const SCALE: u32 = 5000000;
+        // const SCALE: u32 = 5000000;
+        const SCALE: u32 = 500000;
 
         let mut handles = Vec::new();
         let start = Instant::now();
@@ -1279,23 +1680,31 @@ mod tests {
             start.elapsed().as_millis(),
             (THREADS * SCALE) as f32 / (start.elapsed().as_millis()) as f32 / 1000.0
         );
-    }
 
-    #[test]
-    fn can_delete_values() {
-        let tree = Arc::new(BwTree::new(1024 * 1024 * 10));
-
-        for i in 0..10u32 {
-            tree.insert(&i, i + 1);
+        let mut handles = Vec::new();
+        let start = Instant::now();
+        for i in 0..THREADS {
+            let tree = tree.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..SCALE {
+                    let key = i * SCALE + j;
+                    assert!(tree.delete(&key, &(key + 1)));
+                }
+            }));
         }
 
-        assert!(!tree.delete(&1, &1));
-
-        for i in 0..8u32 {
-            assert!(tree.delete(&i, &(i + 1)));
+        for handle in handles {
+            handle.join().unwrap();
         }
 
         let vals = tree.get_values(&1);
         assert_eq!(vals.len(), 0);
+
+        println!(
+            "Deleted {} data points in {} millisec(s), throughput: {} Mop/s",
+            THREADS * SCALE,
+            start.elapsed().as_millis(),
+            (THREADS * SCALE) as f32 / (start.elapsed().as_millis()) as f32 / 1000.0
+        );
     }
 }

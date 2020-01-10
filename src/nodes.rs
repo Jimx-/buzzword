@@ -37,9 +37,10 @@ where
         usize,       /* insert location */
     ),
     InnerDelete(
-        (K, NodeID), /* deleted item */
-        (K, NodeID), /* previous item */
-        (K, NodeID), /* next item */
+        (K, NodeID),         /* deleted item */
+        (Option<K>, NodeID), /* previous item */
+        (Option<K>, NodeID), /* next item */
+        usize,               /* slot in base node */
     ),
     InnerSplit(K /* split key */, NodeID /* right sibling ID */),
     InnerMerge(
@@ -60,6 +61,7 @@ where
         bool,   /* deleted value exists? */
     ),
     LeafSplit(K /* split key */, NodeID /* right sibling ID */),
+    LeafRemove(NodeID /* removed node ID */),
     LeafMerge(
         K,                     /* delete key */
         NodeID,                /* deleted node ID */
@@ -149,6 +151,34 @@ where
             item_count: next.item_count + 1,
             length: next.length + 1,
             node: Node::InnerInsert((insert_key.clone(), insert_id), next_key.clone(), slot),
+            next: Atomic::null(),
+        }
+    }
+
+    pub fn new_inner_delete(
+        delete_key: &K,
+        delete_id: NodeID,
+        prev_key: &Option<K>,
+        prev_id: NodeID,
+        next_key: &Option<K>,
+        next_id: NodeID,
+        slot: usize,
+        next: &TreeNode<K, V>,
+    ) -> Self {
+        Self {
+            low_key: next.low_key.clone(),
+            high_key: next.high_key.clone(),
+            leftmost_child: next.leftmost_child,
+            right_link: next.right_link,
+            base_size: next.base_size,
+            item_count: next.item_count - 1,
+            length: next.length + 1,
+            node: Node::InnerDelete(
+                (delete_key.clone(), delete_id),
+                (prev_key.clone(), prev_id),
+                (next_key.clone(), next_id),
+                slot,
+            ),
             next: Atomic::null(),
         }
     }
@@ -246,6 +276,40 @@ where
             item_count: next.item_count - sibling.item_count,
             length: next.length,
             node: Node::LeafSplit(split_key.clone(), sibling_id),
+            next: Atomic::null(),
+        }
+    }
+
+    pub fn new_leaf_remove(node_id: NodeID, next: &TreeNode<K, V>) -> Self {
+        Self {
+            low_key: next.low_key.clone(),
+            high_key: next.high_key.clone(),
+            leftmost_child: next.leftmost_child,
+            right_link: next.right_link,
+            base_size: next.base_size,
+            item_count: next.item_count,
+            length: next.length,
+            node: Node::LeafRemove(node_id),
+            next: Atomic::null(),
+        }
+    }
+
+    pub fn new_leaf_merge<'g>(
+        merge_key: &K,
+        removed_node_id: NodeID,
+        removed_node_ptr: GuardedTreeNode<K, V>,
+        next: &TreeNode<K, V>,
+        removed_node: &TreeNode<K, V>,
+    ) -> Self {
+        Self {
+            low_key: next.low_key.clone(),
+            high_key: removed_node.high_key.clone(),
+            leftmost_child: next.leftmost_child,
+            right_link: removed_node.right_link,
+            base_size: next.base_size, // unused in leaf merge node
+            item_count: next.item_count + removed_node.item_count,
+            length: next.length + removed_node.length,
+            node: Node::LeafMerge(merge_key.clone(), removed_node_id, removed_node_ptr),
             next: Atomic::null(),
         }
     }
