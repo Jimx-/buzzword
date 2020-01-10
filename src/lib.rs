@@ -1,8 +1,5 @@
 extern crate crossbeam;
 
-#[macro_use]
-extern crate rental;
-
 mod nodes;
 
 pub(crate) type NodeID = u64;
@@ -15,7 +12,7 @@ const MAX_INNER_ITEM_COUNT: usize = 128;
 const MIN_LEAF_ITEM_COUNT: usize = 32;
 const MAX_LEAF_ITEM_COUNT: usize = 128;
 
-use crate::nodes::{GuardedTreeNode, Node, TreeNode};
+use crate::nodes::{Node, TreeNode};
 
 use crossbeam::{
     epoch::{self, Atomic, Guard, Owned, Pointer, Shared},
@@ -72,7 +69,7 @@ where
 pub struct BwTreeImpl<K, V>
 where
     K: 'static + Clone,
-    V: 'static + Clone + Eq + Hash,
+    V: Clone + Eq + Hash,
 {
     mapping_table: Vec<Atomic<TreeNode<K, V>>>,
     key_comparator: Box<dyn Sync + Send + Fn(&K, &K) -> std::cmp::Ordering>,
@@ -438,26 +435,21 @@ where
                         return Ok((node_id, node_ptr, !*overwrite, *slot));
                     }
                 }
-                Node::LeafMerge(merge_key, removed_node_id, removed_node_ptr) => {
+                Node::LeafMerge(merge_key, removed_node_id, removed_node_atomic) => {
                     if (self.key_comparator)(key, merge_key) >= std::cmp::Ordering::Equal {
+                        let removed_node_ptr = removed_node_atomic.load(Ordering::Relaxed, guard);
+
                         // go to right branch
-                        match removed_node_ptr.rent_all(|borrows| {
-                            match self.search_leaf(
-                                *removed_node_id,
-                                *borrows.node,
-                                key,
-                                value,
-                                path,
-                                borrows.guard,
-                            ) {
-                                // discard the pointer as it cannot be carried outside the closure
-                                Ok((_, _, exists, slot)) => Ok((exists, slot)),
-                                _ => Err(()),
-                            }
-                        }) {
-                            Ok((exists, slot)) => return Ok((node_id, node_ptr, exists, slot)),
-                            _ => return Err(()),
-                        }
+                        let (_, _, exists, slot) = self.search_leaf(
+                            *removed_node_id,
+                            removed_node_ptr,
+                            key,
+                            value,
+                            path,
+                            guard,
+                        )?;
+
+                        return Ok((node_id, node_ptr, exists, slot));
                     }
                 }
                 Node::LeafSplit(..) => {}
@@ -746,7 +738,7 @@ where
 
                     deltas.insert(pos, tuple);
                 }
-                Node::LeafMerge(merge_key, _, guarded_ptr) => {
+                Node::LeafMerge(merge_key, _, removed_node_atomic) => {
                     // the merge delta must be the first one on the chain because we disallow any insert/delete beyond the SMO
                     // we only need to consolidate the two branch
                     let next_node = delta.next.load(Ordering::Relaxed, guard);
@@ -760,9 +752,9 @@ where
                     );
                     let right_deltas = deltas.split_off(split_pos);
                     let mut left_branch = self.collect_leaf_values_recur(next_node, deltas, guard);
-                    let right_branch = guarded_ptr.rent_all(move |borrows| {
-                        self.collect_leaf_values_recur(*borrows.node, right_deltas, borrows.guard)
-                    });
+                    let removed_node_ptr = removed_node_atomic.load(Ordering::Relaxed, guard);
+                    let right_branch =
+                        self.collect_leaf_values_recur(removed_node_ptr, right_deltas, guard);
 
                     left_branch.extend(right_branch);
                     return left_branch;
@@ -1129,7 +1121,10 @@ where
                     _ => Err(()),
                 }
             }
-            Node::LeafRemove(_) => {
+            Node::LeafRemove(removed_node_id) => {
+                let removed_node_ptr = node.next.load(Ordering::Relaxed, guard);
+                let removed_node = unsafe { removed_node_ptr.deref() };
+
                 // try to remove this node by publishing a node merge delta with the left sibling
                 let (left_sibling_id, left_sibling_ptr) =
                     self.move_left(node_id, node_ptr, path, guard)?;
@@ -1140,17 +1135,12 @@ where
                     _ => unreachable!(),
                 };
 
-                let guard_removed = Box::new(epoch::pin());
-                let guarded_ptr = GuardedTreeNode::new(guard_removed, |guard| {
-                    node.next.load(Ordering::Relaxed, guard)
-                });
-
                 let delta = Owned::new(TreeNode::<K, V>::new_leaf_merge(
                     &merge_key,
-                    node_id,
-                    guarded_ptr,
+                    *removed_node_id,
+                    removed_node_ptr,
                     left_sibling,
-                    node,
+                    removed_node,
                 ));
 
                 delta.next.store(left_sibling_ptr, Ordering::Relaxed);
@@ -1166,26 +1156,25 @@ where
                     _ => Err(()),
                 }
             }
-            Node::LeafMerge(merge_key, removed_node_id, guarded_ptr) => {
+            Node::LeafMerge(merge_key, removed_node_id, removed_node_atomic) => {
                 let delete_item = (merge_key, *removed_node_id);
+                let remove_node_ptr = removed_node_atomic.load(Ordering::Relaxed, guard);
 
-                guarded_ptr.rent(move |node| {
-                    match self.complete_merge_smo(
-                        node_id,
-                        node_ptr,
-                        delete_item,
-                        *node, // removed node
-                        path,
-                        guard,
-                    ) {
-                        Ok(true) => {
-                            self.consolidate_leaf_node(node_id, node_ptr, guard);
-                            Err(())
-                        }
-                        Ok(false) => Ok(None),
-                        _ => Err(()),
+                match self.complete_merge_smo(
+                    node_id,
+                    node_ptr,
+                    delete_item,
+                    remove_node_ptr, // removed node
+                    path,
+                    guard,
+                ) {
+                    Ok(true) => {
+                        self.consolidate_leaf_node(node_id, node_ptr, guard);
+                        Err(())
                     }
-                })
+                    Ok(false) => Ok(None),
+                    _ => Err(()),
+                }
             }
             _ => Ok(None),
         }
@@ -1596,12 +1585,12 @@ where
 pub struct BwTree<K, V>(BwTreeImpl<K, V>)
 where
     K: 'static + Clone + Ord + std::fmt::Debug,
-    V: 'static + Clone + Eq + Hash + std::fmt::Debug;
+    V: Clone + Eq + Hash + std::fmt::Debug;
 
 impl<K, V> BwTree<K, V>
 where
     K: 'static + Clone + Ord + std::fmt::Debug,
-    V: 'static + Clone + Eq + Hash + std::fmt::Debug,
+    V: Clone + Eq + Hash + std::fmt::Debug,
 {
     pub fn new(mapping_table_size: usize) -> Self {
         Self(BwTreeImpl::new(mapping_table_size, Box::new(K::cmp)))
@@ -1610,8 +1599,8 @@ where
 
 impl<K, V> Deref for BwTree<K, V>
 where
-    K: 'static + Clone + Ord + std::fmt::Debug,
-    V: 'static + Clone + Eq + Hash + std::fmt::Debug,
+    K: Clone + Ord + std::fmt::Debug,
+    V: Clone + Eq + Hash + std::fmt::Debug,
 {
     type Target = BwTreeImpl<K, V>;
 
@@ -1631,7 +1620,7 @@ mod tests {
 
         const THREADS: u32 = 20;
         // const SCALE: u32 = 5000000;
-        const SCALE: u32 = 500000;
+        const SCALE: u32 = 5000000;
 
         let mut handles = Vec::new();
         let start = Instant::now();

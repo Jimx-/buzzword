@@ -1,34 +1,12 @@
 use crate::{NodeID, INVALID_NODE_ID};
 
-use crossbeam::epoch::{Atomic, Guard, Shared};
+use crossbeam::epoch::{Atomic, Shared};
 
-rental! {
-    mod rentals {
-        use super::*;
-
-        #[rental]
-        /// A shared pointer to a tree node protected by the epoch GC and the pin guard with
-        /// which it is loaded.
-        pub struct GuardedTreeNode<K, V>
-        where
-            K: 'static + Clone,
-            V: 'static,
-        {
-            guard: Box<Guard>,
-            node: Shared<'guard, TreeNode<K, V>>,
-        }
-    }
-}
-
-pub use self::rentals::GuardedTreeNode;
-
-unsafe impl<K: Clone, V> Sync for GuardedTreeNode<K, V> {}
-unsafe impl<K: Clone, V> Send for GuardedTreeNode<K, V> {}
+use std::sync::atomic::Ordering;
 
 pub enum Node<K, V>
 where
-    K: 'static + Clone,
-    V: 'static,
+    K: Clone,
 {
     Inner(Vec<(K, NodeID)>),
     InnerInsert(
@@ -45,8 +23,8 @@ where
     InnerSplit(K /* split key */, NodeID /* right sibling ID */),
     InnerMerge(
         K,
-        NodeID,                /* deleted item */
-        GuardedTreeNode<K, V>, /* physical pointer to the deleted node */
+        NodeID,                 /* deleted item */
+        Atomic<TreeNode<K, V>>, /* physical pointer to the merged node */
     ),
 
     Leaf(Vec<(K, V)>),
@@ -63,16 +41,15 @@ where
     LeafSplit(K /* split key */, NodeID /* right sibling ID */),
     LeafRemove(NodeID /* removed node ID */),
     LeafMerge(
-        K,                     /* delete key */
-        NodeID,                /* deleted node ID */
-        GuardedTreeNode<K, V>, /* physical pointer to the deleted node */
+        K,                      /* delete key */
+        NodeID,                 /* deleted node ID */
+        Atomic<TreeNode<K, V>>, /* physical pointer to the merged node */
     ),
 }
 
 pub struct TreeNode<K, V>
 where
-    K: 'static + Clone,
-    V: 'static,
+    K: Clone,
 {
     pub(super) low_key: Option<K>,
     pub(super) high_key: Option<K>,
@@ -297,10 +274,13 @@ where
     pub fn new_leaf_merge<'g>(
         merge_key: &K,
         removed_node_id: NodeID,
-        removed_node_ptr: GuardedTreeNode<K, V>,
+        removed_node_ptr: Shared<TreeNode<K, V>>,
         next: &TreeNode<K, V>,
         removed_node: &TreeNode<K, V>,
     ) -> Self {
+        let link = Atomic::null();
+        link.store(removed_node_ptr, Ordering::Relaxed);
+
         Self {
             low_key: next.low_key.clone(),
             high_key: removed_node.high_key.clone(),
@@ -309,7 +289,7 @@ where
             base_size: next.base_size, // unused in leaf merge node
             item_count: next.item_count + removed_node.item_count,
             length: next.length + removed_node.length,
-            node: Node::LeafMerge(merge_key.clone(), removed_node_id, removed_node_ptr),
+            node: Node::LeafMerge(merge_key.clone(), removed_node_id, link),
             next: Atomic::null(),
         }
     }
