@@ -456,14 +456,14 @@ where
 
                     return Ok((node_id, node_ptr, false, lower_bound));
                 }
-                Node::LeafInsert((k, v), slot, overwrite) => {
+                Node::LeafInsert((k, v), slot, _) => {
                     if (self.key_comparator)(k, key) == std::cmp::Ordering::Equal && v == value {
-                        return Ok((node_id, node_ptr, *overwrite, *slot));
+                        return Ok((node_id, node_ptr, true, *slot));
                     }
                 }
-                Node::LeafDelete((k, v), slot, overwrite) => {
+                Node::LeafDelete((k, v), slot, _) => {
                     if (self.key_comparator)(k, key) == std::cmp::Ordering::Equal && v == value {
-                        return Ok((node_id, node_ptr, !*overwrite, *slot));
+                        return Ok((node_id, node_ptr, false, *slot));
                     }
                 }
                 Node::LeafMerge(merge_key, removed_node_id, removed_node_atomic) => {
