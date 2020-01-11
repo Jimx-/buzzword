@@ -4,6 +4,7 @@ mod nodes;
 
 pub(crate) type NodeID = u64;
 pub(crate) const INVALID_NODE_ID: NodeID = 0;
+const FIRST_LEAF_ID: NodeID = 1;
 
 const MAX_INNER_CHAIN_LENGTH: usize = 8;
 const MAX_LEAF_CHAIN_LENGTH: usize = 8;
@@ -70,7 +71,7 @@ where
 pub struct BwTreeImpl<K, V>
 where
     K: 'static + Clone + std::fmt::Debug,
-    V: Clone + Eq + Hash,
+    V: Clone + Eq + Hash + std::fmt::Debug,
 {
     mapping_table: Vec<Atomic<TreeNode<K, V>>>,
     key_comparator: Box<dyn Sync + Send + Fn(&K, &K) -> std::cmp::Ordering>,
@@ -94,8 +95,8 @@ where
         let tree = Self {
             mapping_table,
             key_comparator,
-            root_id: AtomicU64::new(1),
-            next_node_id: AtomicU64::new(1),
+            root_id: AtomicU64::new(FIRST_LEAF_ID),
+            next_node_id: AtomicU64::new(FIRST_LEAF_ID),
             free_node_ids: SegQueue::new(),
         };
 
@@ -1718,6 +1719,107 @@ where
 
         true
     }
+
+    pub fn iter(&self) -> BwTreeIterator<K, V> {
+        let guard = &epoch::pin();
+
+        let first_node = self.load_node_no_check(FIRST_LEAF_ID, Ordering::Acquire, guard);
+        let vals = self.collect_leaf_values(first_node, guard);
+
+        BwTreeIterator {
+            tree: self,
+            iter: vals.into_iter(),
+            high_key: unsafe { first_node.deref() }.high_key.clone(),
+        }
+    }
+
+    pub fn iter_from(&self, start_key: &K) -> BwTreeIterator<K, V> {
+        BwTreeIterator {
+            tree: self,
+            iter: Vec::new().into_iter(),
+            high_key: Some(start_key.clone()),
+        }
+    }
+
+    pub fn scan_next(&self, key: K) -> (Option<K>, std::vec::IntoIter<(K, V)>) {
+        let mut search_key = Some(key);
+
+        while let Some(key) = search_key {
+            let guard = &epoch::pin();
+            let (_, leaf_node_ptr, _) = loop {
+                match self.search(&key, guard) {
+                    Ok(result) => break result,
+                    _ => continue,
+                };
+            };
+
+            let high_key = unsafe { leaf_node_ptr.deref() }.high_key.clone();
+            let mut vals = self.collect_leaf_values(leaf_node_ptr, guard);
+            let keys = vals.iter().map(|(k, _)| k).collect::<Vec<&K>>();
+            let lower_bound = binary_search(&keys, &&key, 0, vals.len(), false, |x, y| {
+                (self.key_comparator)(x, y)
+            });
+
+            let vals = vals.split_off(lower_bound);
+            if vals.is_empty() {
+                search_key = high_key;
+            } else {
+                return (high_key, vals.into_iter());
+            }
+        }
+
+        (None, Vec::new().into_iter())
+    }
+}
+
+pub struct BwTreeIterator<'a, K, V>
+where
+    K: 'static + Clone + std::fmt::Debug,
+    V: Clone + Eq + Hash + std::fmt::Debug,
+{
+    tree: &'a BwTreeImpl<K, V>,
+    iter: std::vec::IntoIter<(K, V)>,
+    high_key: Option<K>,
+}
+
+impl<K, V> Iterator for BwTreeIterator<'_, K, V>
+where
+    K: 'static + Clone + Ord + std::fmt::Debug,
+    V: Clone + Eq + Hash + std::fmt::Debug,
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter.next() {
+            None => {
+                let high_key = self.high_key.take();
+                match high_key {
+                    Some(high_key) => {
+                        let (high_key, iter) = self.tree.scan_next(high_key);
+                        self.iter = iter;
+                        self.high_key = high_key;
+
+                        self.next()
+                    }
+                    None => None, // no high key -- last node
+                }
+            }
+            otherwise => otherwise, // iterator not drained
+        }
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a BwTreeImpl<K, V>
+where
+    K: 'static + Clone + Ord + std::fmt::Debug,
+    V: Clone + Eq + Hash + std::fmt::Debug,
+{
+    type Item = (K, V);
+    type IntoIter = BwTreeIterator<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
 }
 
 pub struct BwTree<K, V>(BwTreeImpl<K, V>)
@@ -1747,6 +1849,19 @@ where
     }
 }
 
+impl<'a, K, V> IntoIterator for &'a BwTree<K, V>
+where
+    K: 'static + Clone + Ord + std::fmt::Debug,
+    V: Clone + Eq + Hash + std::fmt::Debug,
+{
+    type Item = (K, V);
+    type IntoIter = BwTreeIterator<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1757,7 +1872,7 @@ mod tests {
         let tree = Arc::new(BwTree::new(1024 * 1024 * 10));
 
         const THREADS: u32 = 20;
-        const SCALE: u32 = 5000000;
+        const SCALE: u32 = 500000;
 
         let mut handles = Vec::new();
         let start = Instant::now();

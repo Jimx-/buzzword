@@ -13,6 +13,10 @@ let vals = tree.get_values(&1);
 assert_eq!(vals.len(), 1);
 assert_eq!(vals[0], "alice");
 
+for (k, v) in &tree {
+    println!("{} -> {}", k, v);
+}
+
 assert!(tree1.delete(&1, &"alice"));
 #+END_SRC
 
