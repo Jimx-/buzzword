@@ -1,0 +1,25 @@
+#+TITLE: Buzzword
+
+Buzzword is lock-free Bw-Tree ([[https://www.microsoft.com/en-us/research/publication/the-bw-tree-a-b-tree-for-new-hardware/][paper]]) implementation that supports fast insertions/queries of billions of key-value pairs.
+
+* Example
+#+BEGIN_SRC rust
+let tree = BwTree::new(1024 * 1024 /* mapping table size */);
+
+tree.insert(&1, "alice");
+tree.insert(&2, "bob");
+
+let vals = tree.get_values(&1);
+assert_eq!(vals.len(), 1);
+assert_eq!(vals[0], "alice");
+
+assert!(tree1.delete(&1, &"alice"));
+#+END_SRC
+
+* Performance
+On Intel(R) Core(TM) i7-9700 with 32GB RAM (20 threads):
+| Workload                           | Avg. Throughput (MOp/s) |
+|------------------------------------+-------------------------|
+| 1B (u32, u32) concurrent insert    |                    6.33 |
+| 1B (u32, u32) concurrent seq. scan |                    24.6 |
+| 1B (u32, u32) concurrent delete    |                    4.35 |
