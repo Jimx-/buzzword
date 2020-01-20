@@ -17,13 +17,13 @@ for (k, v) in &tree {
     println!("{} -> {}", k, v);
 }
 
-assert!(tree1.delete(&1, &"alice"));
+assert!(tree.delete(&1, &"alice"));
 #+END_SRC
 
 * Performance
-On Intel(R) Core(TM) i7-9700 with 32GB RAM (20 threads):
-| Workload                           | Avg. Throughput (MOp/s) |
-|------------------------------------+-------------------------|
-| 1B (u32, u32) concurrent insert    |                    6.33 |
-| 1B (u32, u32) concurrent seq. scan |                    24.6 |
-| 1B (u32, u32) concurrent delete    |                    4.35 |
+On Intel(R) Xeon(R) Gold 6230 (80 threads):
+| Workload                            | Avg. Throughput (MOp/s) |
+|-------------------------------------+-------------------------|
+| 10B (u32, u32) concurrent insert    |                   11.53 |
+| 10B (u32, u32) concurrent seq. scan |                   78.52 |
+| 10B (u32, u32) concurrent delete    |                   13.49 |
