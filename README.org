@@ -24,6 +24,6 @@ assert!(tree.delete(&1, &"alice"));
 On Intel(R) Xeon(R) Gold 6230 (80 threads):
 | Workload                            | Avg. Throughput (MOp/s) |
 |-------------------------------------+-------------------------|
-| 10B (u32, u32) concurrent insert    |                   11.53 |
-| 10B (u32, u32) concurrent seq. scan |                   78.52 |
-| 10B (u32, u32) concurrent delete    |                   13.49 |
+| 1B (u32, u32) concurrent insert     |                   11.53 |
+| 1B (u32, u32) concurrent seq. scan  |                   78.52 |
+| 1B (u32, u32) concurrent delete     |                   13.49 |
