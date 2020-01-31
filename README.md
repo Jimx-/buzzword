@@ -9,18 +9,18 @@ Buzzword is lock-free Bw-Tree ([paper](https://www.microsoft.com/en-us/research/
 ```rust
 let tree = BwTree::new(1024 * 1024 /* mapping table size */);
 
-tree.insert(&1, &quot;alice&quot;);
-tree.insert(&2, &quot;bob&quot;);
+tree.insert(&1, "alice");
+tree.insert(&2, "bob");
 
 let vals = tree.get_values(&1);
 assert_eq!(vals.len(), 1);
-assert_eq!(vals[0], &quot;alice&quot;);
+assert_eq!(vals[0], "alice");
 
 for (k, v) in &tree {
- println!(&quot;{} -&gt; {}&quot;, k, v);
+    println!("{} -> {}", k, v);
 }
 
-assert!(tree.delete(&1, &&quot;alice&quot;));
+assert!(tree.delete(&1, &"alice"));
 ```
 
 ## Performance
