@@ -17,16 +17,6 @@ pipeline {
                 sh "cargo test"
             }
         }
-        stage('Clippy') {
-            steps {
-                sh "cargo clippy --all"
-            }
-        }
-        stage('Rustfmt') {
-            steps {
-                sh "cargo fmt --all -- --write-mode diff"
-            }
-        }
         stage('Doc') {
             steps {
                 sh "cargo doc"
