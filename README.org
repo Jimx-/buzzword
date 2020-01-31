@@ -1,4 +1,5 @@
 #+TITLE: Buzzword
+[[https://ci2.jimx.site:8080/buildStatus/icon?job=buzzword]]
 
 Buzzword is lock-free Bw-Tree ([[https://www.microsoft.com/en-us/research/publication/the-bw-tree-a-b-tree-for-new-hardware/][paper]]) implementation that supports fast insertions/queries of billions of key-value pairs.
 

@@ -19,12 +19,12 @@ pipeline {
         }
         stage('Clippy') {
             steps {
-                sh "cargo +nightly clippy --all"
+                sh "cargo clippy --all"
             }
         }
         stage('Rustfmt') {
             steps {
-                sh "cargo +nightly fmt --all -- --write-mode diff"
+                sh "cargo fmt --all -- --write-mode diff"
             }
         }
         stage('Doc') {
